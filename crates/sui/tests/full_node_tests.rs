@@ -1220,15 +1220,22 @@ async fn get_obj_read_from_node(
     }
 }
 
-#[tokio::test]
+#[sim_test]
 async fn test_get_objects_read() -> Result<(), anyhow::Error> {
     telemetry_subscribers::init_for_testing();
     let mut test_cluster = init_cluster_builder_env_aware().build().await?;
     let context = &mut test_cluster.wallet;
-    let node = &test_cluster.fullnode_handle.as_ref().unwrap().sui_node;
+    let sui_node = start_a_fullnode(&test_cluster.swarm, false).await?;
+    let node = if cfg!(msim) {
+        &sui_node
+    } else {
+        &test_cluster.fullnode_handle.as_ref().unwrap().sui_node
+    };
 
     // Create the object
     let (sender, object_id, _) = create_devnet_nft(context).await?;
+    sleep(Duration::from_secs(15)).await;
+
     let recipient = context.config.keystore.addresses().get(1).cloned().unwrap();
     assert_ne!(sender, recipient);
 
@@ -1250,6 +1257,7 @@ async fn test_get_objects_read() -> Result<(), anyhow::Error> {
         recipient,
     );
     context.execute_transaction(nft_transfer_tx).await.unwrap();
+    sleep(Duration::from_secs(15)).await;
 
     let (object_ref_v2, object_v2, _) = get_obj_read_from_node(node, object_id, None).await?;
     assert_ne!(object_ref_v2, object_ref_v1);
@@ -1259,6 +1267,7 @@ async fn test_get_objects_read() -> Result<(), anyhow::Error> {
     let (_tx_cert, effects) =
         delete_devnet_nft(context, &recipient, object_ref_v2, package_ref).await;
     assert_eq!(effects.status, SuiExecutionStatus::Success);
+    sleep(Duration::from_secs(15)).await;
 
     // Now test get_object_read
     let object_ref_v3 = match node.state().get_object_read(&object_id).await? {
