@@ -33,6 +33,49 @@ function FunctionView({ pkgId }: { pkgId: string }) {
                                                 <div className="font-semibold">
                                                     {name}
                                                 </div>
+                                                <div>
+                                                    {Object.entries(
+                                                        data[name]
+                                                            .exposed_functions
+                                                    ).map(
+                                                        ([fnName, fnData]) => (
+                                                            <div
+                                                                key={fnName}
+                                                                className="mt-4"
+                                                            >
+                                                                <div className="pl-2.5">
+                                                                    {fnName}
+                                                                </div>
+                                                                <div className="bg-white">
+                                                                    {fnData.parameters.map(
+                                                                        (
+                                                                            argData,
+                                                                            index
+                                                                        ) => (
+                                                                            <div
+                                                                                key={
+                                                                                    index
+                                                                                }
+                                                                            >
+                                                                                {argData.TypeParameter !==
+                                                                                undefined
+                                                                                    ? `Type Parameter: ${fnData.type_parameters[
+                                                                                          argData
+                                                                                              .TypeParameter
+                                                                                      ].abilities.join(
+                                                                                          ', '
+                                                                                      )}`
+                                                                                    : JSON.stringify(
+                                                                                          argData
+                                                                                      )}
+                                                                            </div>
+                                                                        )
+                                                                    )}
+                                                                </div>
+                                                            </div>
+                                                        )
+                                                    )}
+                                                </div>
                                             </div>
                                         )
                                     )}
