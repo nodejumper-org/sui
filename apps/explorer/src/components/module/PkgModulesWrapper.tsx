@@ -6,6 +6,7 @@ import clsx from 'clsx';
 import { useState, useEffect, useCallback } from 'react';
 import { useSearchParams } from 'react-router-dom';
 
+import FunctionView from './FunctionView';
 import ModuleView from './ModuleView';
 
 import { ReactComponent as SearchIcon } from '~/assets/SVGIcons/24px/Search.svg';
@@ -169,6 +170,7 @@ function PkgModuleViewWrapper({ id, modules }: Props) {
                     </TabPanels>
                 </TabGroup>
             </div>
+            <FunctionView pkgId={id} />
         </div>
     );
 }
