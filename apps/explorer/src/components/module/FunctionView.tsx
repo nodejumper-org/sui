@@ -55,8 +55,11 @@ function FunctionView({
                                                                     key={index}
                                                                     className="pl-2.5 mt-4"
                                                                 >
-                                                                    {argData.TypeParameter !==
-                                                                    undefined
+                                                                    {fnData
+                                                                        .type_parameters[
+                                                                        argData
+                                                                            .TypeParameter
+                                                                    ]
                                                                         ? fnData.type_parameters[
                                                                               argData
                                                                                   .TypeParameter
