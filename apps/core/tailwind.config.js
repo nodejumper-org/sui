@@ -3,6 +3,7 @@
 
 const defaultTheme = require("tailwindcss/defaultTheme");
 
+/** @type {import('tailwindcss').Config} */
 module.exports = {
   content: ["./src/**/*.{js,jsx,ts,tsx}"],
   theme: {
@@ -104,6 +105,9 @@ module.exports = {
       animation: {
         shimmer: "shimmer 2s infinite linear",
       },
+      height: {
+        header: '68px'
+      }
     },
   },
   corePlugins: {
