@@ -7,6 +7,7 @@ use std::{
 };
 
 use sui_types::{base_types::TransactionDigest, error::SuiResult, messages::VerifiedCertificate};
+use tap::TapFallible;
 use tokio::sync::mpsc::UnboundedSender;
 use tracing::error;
 
@@ -31,7 +32,7 @@ pub(crate) struct TransactionManager {
     authority_store: Arc<AuthorityStore>,
     missing_inputs: BTreeMap<ObjectKey, TransactionDigest>,
     pending_certificates: BTreeMap<TransactionDigest, PendingCertInfo>,
-    tx_ready_certificates: UnboundedSender<VerifiedCertificate>,
+    tx_ready_certificates: UnboundedSender<(VerifiedCertificate, Option<ValidEffectsInfo>)>,
     metrics: Arc<AuthorityMetrics>,
 }
 
@@ -40,7 +41,7 @@ impl TransactionManager {
     /// other persistent data.
     pub(crate) async fn new(
         authority_store: Arc<AuthorityStore>,
-        tx_ready_certificates: UnboundedSender<VerifiedCertificate>,
+        tx_ready_certificates: UnboundedSender<(VerifiedCertificate, Option<ValidEffectsInfo>)>,
         metrics: Arc<AuthorityMetrics>,
     ) -> TransactionManager {
         let mut transaction_manager = TransactionManager {
@@ -100,7 +101,7 @@ impl TransactionManager {
                 .expect("Are shared object locks set prior to enqueueing certificates?");
 
             if missing.is_empty() {
-                self.certificate_ready(cert);
+                self.certificate_ready(cert, valid_effects);
                 continue;
             }
 
@@ -162,7 +163,14 @@ impl TransactionManager {
                         continue;
                     }
                 };
-                self.certificate_ready(cert);
+                let Ok(valid_effects) = self
+                    .authority_store
+                    .get_valid_effects(&digest)
+                    .tap_err(|e| error!("failed to read valid effects: {}", e)) else {
+                        continue;
+                };
+
+                self.certificate_ready(cert, valid_effects);
             }
         }
         self.metrics
@@ -174,8 +182,14 @@ impl TransactionManager {
     }
 
     /// Marks the given certificate as ready to be executed.
-    fn certificate_ready(&self, certificate: VerifiedCertificate) {
+    fn certificate_ready(
+        &self,
+        certificate: VerifiedCertificate,
+        valid_effects: Option<ValidEffectsInfo>,
+    ) {
         self.metrics.transaction_manager_num_ready.inc();
-        let _ = self.tx_ready_certificates.send(certificate);
+        let _ = self
+            .tx_ready_certificates
+            .send((certificate, valid_effects));
     }
 }

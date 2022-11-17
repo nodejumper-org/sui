@@ -38,7 +38,7 @@ use typed_store::Map;
 
 pub use authority_notify_read::EffectsNotifyRead;
 pub use authority_store::{
-    AuthorityStore, GatewayStore, ResolverWrapper, SuiDataStore, UpdateType,
+    AuthorityStore, GatewayStore, ResolverWrapper, SuiDataStore, UpdateType, ValidEffectsInfo,
 };
 use narwhal_config::{
     Committee as ConsensusCommittee, WorkerCache as ConsensusWorkerCache,
@@ -501,6 +501,8 @@ impl AuthorityMetrics {
 pub type StableSyncAuthoritySigner =
     Pin<Arc<dyn signature::Signer<AuthoritySignature> + Send + Sync>>;
 
+type ReadyCertificateReceiver = UnboundedReceiver<(VerifiedCertificate, Option<ValidEffectsInfo>)>;
+
 pub struct AuthorityState {
     // Fixed size, static, identity of the authority
     /// The name of this authority.
@@ -540,7 +542,7 @@ pub struct AuthorityState {
     /// This member temporarily holds the receiver beginning from AuthorityState initialization,
     /// until the receiver is extracted by execution driver. This a bit awkward because
     /// AuthorityState is created before execution driver.
-    rx_ready_certificates: tokio::sync::Mutex<Option<UnboundedReceiver<VerifiedCertificate>>>,
+    rx_ready_certificates: tokio::sync::Mutex<Option<ReadyCertificateReceiver>>,
 
     // Structures needed for handling batching and notifications.
     /// The sender to notify of new transactions
@@ -677,7 +679,7 @@ impl AuthorityState {
         // giving us incorrect effects.
         // TODO: allow CertifiedTransactionEffects only
         effects: &TransactionEffectsEnvelope<S>,
-    ) -> SuiResult {
+    ) -> SuiResult<VerifiedTransactionInfoResponse> {
         let _metrics_guard = start_timer(self.metrics.handle_node_sync_certificate_latency.clone());
         let digest = *certificate.digest();
         debug!(?digest, "handle_certificate_with_effects");
@@ -714,7 +716,7 @@ impl AuthorityState {
                 input_objects = ?certificate.data().data.input_objects(),
                 "Locally executed effects do not match canonical effects!");
         }
-        Ok(())
+        Ok(resp)
     }
 
     #[instrument(level = "trace", skip_all)]
@@ -1660,7 +1662,7 @@ impl AuthorityState {
     /// Must only be called once, from execution driver only.
     pub(crate) async fn ready_certificates_stream(
         &self,
-    ) -> Option<UnboundedReceiver<VerifiedCertificate>> {
+    ) -> Option<UnboundedReceiver<(VerifiedCertificate, Option<ValidEffectsInfo>)>> {
         let mut rx_ready_certificates = self.rx_ready_certificates.lock().await;
         rx_ready_certificates.take()
     }
