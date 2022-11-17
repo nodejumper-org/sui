@@ -77,6 +77,10 @@ enum LockServiceQueries {
         objects: Vec<ObjectRef>,
         resp: oneshot::Sender<SuiResult>,
     },
+    GetTxSequence {
+        tx: TransactionDigest,
+        resp: oneshot::Sender<Result<Option<TxSequenceNumber>, SuiError>>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,7 +363,7 @@ impl LockServiceImpl {
     /// Loop to continuously process mutating commands in a single thread from async senders.
     /// It terminates when the sender drops, which usually is when the containing data store is dropped.
     fn run_command_loop(&self, mut receiver: Receiver<LockServiceCommands>) {
-        info!("LockService command processing loop started");
+        debug!("LockService command processing loop started");
         // NOTE: we use blocking_recv() as its faster than using regular async recv() with awaits in a loop
         while let Some(msg) = receiver.blocking_recv() {
             match msg {
@@ -408,7 +412,7 @@ impl LockServiceImpl {
 
     /// Loop to continuously process queries in a single thread
     fn run_queries_loop(&self, mut receiver: Receiver<LockServiceQueries>) {
-        info!("LockService queries processing loop started");
+        debug!("LockService queries processing loop started");
         while let Some(msg) = receiver.blocking_recv() {
             match msg {
                 LockServiceQueries::GetLock { object, resp } => {
@@ -418,6 +422,11 @@ impl LockServiceImpl {
                 }
                 LockServiceQueries::CheckLocksExist { objects, resp } => {
                     if let Err(_e) = resp.send(self.locks_exist(&objects)) {
+                        warn!("Could not respond to sender, sender dropped!");
+                    }
+                }
+                LockServiceQueries::GetTxSequence { tx, resp } => {
+                    if let Err(_e) = resp.send(self.get_tx_sequence(tx)) {
                         warn!("Could not respond to sender, sender dropped!");
                     }
                 }
@@ -575,6 +584,28 @@ impl LockService {
                 .query_sender()
                 .send(LockServiceQueries::GetLock {
                     object,
+                    resp: os_sender,
+                })
+                .await
+                .expect("Could not send message to inner LockService");
+            os_receiver
+                .await
+                .expect("Response from lockservice was cancelled, should not happen!")
+        })
+        .await
+    }
+
+    pub async fn get_tx_sequence(
+        &self,
+        tx: TransactionDigest,
+    ) -> SuiResult<Option<TxSequenceNumber>> {
+        block_on_future_in_sim(async move {
+            let (os_sender, os_receiver) =
+                oneshot::channel::<Result<Option<TxSequenceNumber>, SuiError>>();
+            self.inner
+                .query_sender()
+                .send(LockServiceQueries::GetTxSequence {
+                    tx,
                     resp: os_sender,
                 })
                 .await

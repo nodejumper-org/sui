@@ -1,6 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+extern crate core;
+
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::sync::Arc;
@@ -13,15 +15,16 @@ use futures_core::Stream;
 use jsonrpsee::core::client::{ClientT, Subscription};
 use jsonrpsee::http_client::{HttpClient, HttpClientBuilder};
 use jsonrpsee::ws_client::{WsClient, WsClientBuilder};
-use serde_json::Value;
 
 use rpc_types::{
     GetPastObjectDataResponse, SuiCertifiedTransaction, SuiExecuteTransactionResponse,
     SuiParsedTransactionResponse, SuiTransactionEffects,
 };
+use serde_json::Value;
 pub use sui_config::gateway;
 use sui_core::gateway_state::TxSeqNumber;
 pub use sui_json as json;
+use sui_json_rpc::api::EventReadApiClient;
 use sui_json_rpc::api::EventStreamingApiClient;
 use sui_json_rpc::api::RpcBcsApiClient;
 use sui_json_rpc::api::RpcFullNodeReadApiClient;
@@ -29,14 +32,15 @@ use sui_json_rpc::api::RpcReadApiClient;
 use sui_json_rpc::api::TransactionExecutionApiClient;
 pub use sui_json_rpc_types as rpc_types;
 use sui_json_rpc_types::{
-    GetObjectDataResponse, GetRawObjectDataResponse, SuiEventEnvelope, SuiEventFilter,
+    EventPage, GetObjectDataResponse, GetRawObjectDataResponse, SuiEventEnvelope, SuiEventFilter,
     SuiObjectInfo, SuiTransactionResponse, TransactionsPage,
 };
 use sui_transaction_builder::{DataReader, TransactionBuilder};
 pub use sui_types as types;
 use sui_types::base_types::{ObjectID, SuiAddress, TransactionDigest};
+use sui_types::event::EventID;
 use sui_types::messages::VerifiedTransaction;
-use sui_types::query::{Ordering, TransactionQuery};
+use sui_types::query::{EventQuery, TransactionQuery};
 use types::base_types::SequenceNumber;
 use types::committee::EpochId;
 use types::error::TRANSACTION_NOT_FOUND_MSG_PREFIX;
@@ -89,10 +93,24 @@ struct ServerInfo {
 }
 
 impl RpcClient {
-    pub async fn new(http: &str, ws: Option<&str>) -> Result<Self, anyhow::Error> {
-        let http = HttpClientBuilder::default().build(http)?;
+    pub async fn new(
+        http: &str,
+        ws: Option<&str>,
+        request_timeout: Option<Duration>,
+    ) -> Result<Self, anyhow::Error> {
+        let mut http_builder = HttpClientBuilder::default();
+        if let Some(request_timeout) = request_timeout {
+            http_builder = http_builder.request_timeout(request_timeout);
+        }
+        let http = http_builder.build(http)?;
+
         let ws = if let Some(url) = ws {
-            Some(WsClientBuilder::default().build(url).await?)
+            let mut ws_builder = WsClientBuilder::default();
+            if let Some(request_timeout) = request_timeout {
+                ws_builder = ws_builder.request_timeout(request_timeout);
+            }
+            let ws = ws_builder.build(url).await?;
+            Some(ws)
         } else {
             None
         };
@@ -147,8 +165,12 @@ impl RpcClient {
 }
 
 impl SuiClient {
-    pub async fn new(http_url: &str, ws_url: Option<&str>) -> Result<Self, anyhow::Error> {
-        let rpc = RpcClient::new(http_url, ws_url).await?;
+    pub async fn new(
+        http_url: &str,
+        ws_url: Option<&str>,
+        request_timeout: Option<Duration>,
+    ) -> Result<Self, anyhow::Error> {
+        let rpc = RpcClient::new(http_url, ws_url, request_timeout).await?;
         let api = Arc::new(rpc);
         let read_api = Arc::new(ReadApi { api: api.clone() });
         let quorum_driver = QuorumDriver { api: api.clone() };
@@ -263,12 +285,12 @@ impl ReadApi {
         query: TransactionQuery,
         cursor: Option<TransactionDigest>,
         limit: Option<usize>,
-        order: Ordering,
+        descending_order: Option<bool>,
     ) -> anyhow::Result<TransactionsPage> {
         Ok(self
             .api
             .http
-            .get_transactions(query, cursor, limit, order)
+            .get_transactions(query, cursor, limit, descending_order)
             .await?)
     }
 }
@@ -289,6 +311,20 @@ impl EventApi {
             }
             _ => Err(anyhow!("Subscription only supported by WebSocket client.")),
         }
+    }
+
+    pub async fn get_events(
+        &self,
+        query: EventQuery,
+        cursor: Option<EventID>,
+        limit: Option<usize>,
+        descending_order: Option<bool>,
+    ) -> anyhow::Result<EventPage> {
+        Ok(self
+            .0
+            .http
+            .get_events(query, cursor, limit, descending_order)
+            .await?)
     }
 }
 

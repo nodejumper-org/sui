@@ -157,6 +157,7 @@ export type GetObjectDataResponse = {
 export type ObjectDigest = string;
 export type ObjectId = string;
 export type SequenceNumber = number;
+export type Order = 'ascending' | 'descending';
 
 /* -------------------------------------------------------------------------- */
 /*                              Helper functions                              */
@@ -245,7 +246,7 @@ export function getSharedObjectInitialVersion(
 
 export function isSharedObject(resp: GetObjectDataResponse): boolean {
   const owner = getObjectOwner(resp);
-  return owner === 'Shared' || (typeof owner === 'object' && 'Shared' in owner);
+  return (typeof owner === 'object' && 'Shared' in owner);
 }
 
 export function isImmutableObject(resp: GetObjectDataResponse): boolean {

@@ -1,26 +1,23 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
-    certificate_waiter::CertificateWaiter, common::create_test_vote_store, core::Core,
-    header_waiter::HeaderWaiter, metrics::PrimaryMetrics, synchronizer::Synchronizer,
+    certificate_waiter::CertificateWaiter, core::Core, metrics::PrimaryMetrics,
+    synchronizer::Synchronizer,
 };
 use anemo::async_trait;
 use anyhow::Result;
-use config::{Committee, Epoch, WorkerId};
+use config::{Epoch, WorkerId};
 use crypto::{PublicKey, Signature};
 use fastcrypto::{hash::Hash, traits::KeyPair, SignatureService};
 use indexmap::IndexMap;
 use itertools::Itertools;
 use network::P2pNetwork;
-use node::NodeStorage;
 use once_cell::sync::OnceCell;
 use prometheus::Registry;
-use std::{
-    collections::{BTreeSet, HashMap},
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 use storage::CertificateStore;
+use storage::NodeStorage;
+
 use test_utils::{temp_dir, CommitteeFixture};
 use tokio::{
     sync::{
@@ -30,19 +27,20 @@ use tokio::{
     time::sleep,
 };
 use types::{
-    BatchDigest, Certificate, CertificateDigest, ConsensusStore, FetchCertificatesRequest,
+    BatchDigest, Certificate, CertificateDigest, FetchCertificatesRequest,
     FetchCertificatesResponse, GetCertificatesRequest, GetCertificatesResponse, Header,
     HeaderDigest, Metadata, PayloadAvailabilityRequest, PayloadAvailabilityResponse,
-    PrimaryMessage, PrimaryToPrimary, PrimaryToPrimaryServer, ReconfigureNotification, Round,
+    PrimaryMessage, PrimaryToPrimary, PrimaryToPrimaryServer, ReconfigureNotification,
+    RequestVoteRequest, RequestVoteResponse, Round,
 };
 
-struct FetchCertificateProxy {
+pub struct NetworkProxy {
     request: Sender<FetchCertificatesRequest>,
     response: Arc<Mutex<Receiver<FetchCertificatesResponse>>>,
 }
 
 #[async_trait]
-impl PrimaryToPrimary for FetchCertificateProxy {
+impl PrimaryToPrimary for NetworkProxy {
     async fn send_message(
         &self,
         request: anemo::Request<PrimaryMessage>,
@@ -51,6 +49,12 @@ impl PrimaryToPrimary for FetchCertificateProxy {
             "FetchCertificateProxy::send_message() is unimplemented!! {:#?}",
             request
         );
+    }
+    async fn request_vote(
+        &self,
+        _request: anemo::Request<RequestVoteRequest>,
+    ) -> Result<anemo::Response<RequestVoteResponse>, anemo::rpc::Status> {
+        unimplemented!()
     }
     async fn get_certificates(
         &self,
@@ -70,37 +74,13 @@ impl PrimaryToPrimary for FetchCertificateProxy {
             self.response.lock().await.recv().await.unwrap(),
         ))
     }
+
     async fn get_payload_availability(
         &self,
         _request: anemo::Request<PayloadAvailabilityRequest>,
     ) -> Result<anemo::Response<PayloadAvailabilityResponse>, anemo::rpc::Status> {
         unimplemented!()
     }
-}
-
-// Simulate consensus committing all certificates written to store, by updating last committed
-// rounds to the last written rounds.
-#[allow(clippy::mutable_key_type)]
-fn write_last_committed(
-    committee: &Committee,
-    certificate_store: &CertificateStore,
-    consensus_sotre: &Arc<ConsensusStore>,
-) {
-    let committed_rounds: HashMap<PublicKey, Round> = committee
-        .authorities()
-        .map(|(name, _)| {
-            (
-                name.clone(),
-                certificate_store
-                    .last_round_number(name)
-                    .unwrap()
-                    .unwrap_or(0),
-            )
-        })
-        .collect();
-    consensus_sotre
-        .write_consensus_state(&committed_rounds, &0, &CertificateDigest::default())
-        .expect("Write to consensus store failed!");
 }
 
 async fn verify_certificates_in_store(
@@ -143,7 +123,7 @@ fn verify_certificates_not_in_store(
         .is_none());
 }
 
-// Unsed below to construct malformed Headers
+// Used below to construct malformed Headers
 // Note: this should always mimic the Header struct, only changing the visibility of the id field to public
 #[allow(dead_code)]
 struct BadHeader {
@@ -160,7 +140,6 @@ struct BadHeader {
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn fetch_certificates_basic() {
     let fixture = CommitteeFixture::builder().randomize_ports(true).build();
-    let committee = fixture.committee();
     let worker_cache = fixture.shared_worker_cache();
     let primary = fixture.authorities().next().unwrap();
     let name = primary.public_key();
@@ -169,15 +148,11 @@ async fn fetch_certificates_basic() {
 
     // kept empty
     let (_tx_reconfigure, rx_reconfigure) =
-        watch::channel(ReconfigureNotification::NewEpoch(committee.clone()));
-    // synchronizer to header waiter
-    let (tx_header_waiter, rx_header_waiter) = test_utils::test_channel!(1000);
+        watch::channel(ReconfigureNotification::NewEpoch(fixture.committee()));
     // synchronizer to certificate waiter
     let (tx_certificate_waiter, rx_certificate_waiter) = test_utils::test_channel!(1000);
-    // primary messages
-    let (tx_primary_messages, rx_primary_messages) = test_utils::test_channel!(1000);
-    // header waiter to primary
-    let (tx_headers_loopback, rx_headers_loopback) = test_utils::test_channel!(1000);
+    // certificates
+    let (tx_certificates, rx_certificates) = test_utils::test_channel!(1000);
     // certificate waiter to primary
     let (tx_certificates_loopback, rx_certificates_loopback) = test_utils::test_channel!(1000);
     // proposer back to the core
@@ -195,25 +170,26 @@ async fn fetch_certificates_basic() {
     let store = NodeStorage::reopen(temp_dir());
     let certificate_store = store.certificate_store.clone();
     let payload_store = store.payload_store.clone();
-    let consensus_store = store.consensus_store.clone();
 
-    // Signal consensus round
+    // Signal rounds
     let (_tx_consensus_round_updates, rx_consensus_round_updates) = watch::channel(0u64);
+    let (_tx_narwhal_round_updates, rx_narwhal_round_updates) = watch::channel(0u64);
 
     // Make a synchronizer for the core.
-    let synchronizer = Synchronizer::new(
+    let synchronizer = Arc::new(Synchronizer::new(
         name.clone(),
-        &committee,
+        fixture.committee().into(),
+        worker_cache.clone(),
         certificate_store.clone(),
         payload_store.clone(),
-        tx_header_waiter,
         tx_certificate_waiter,
+        rx_consensus_round_updates.clone(),
         None,
-    );
+    ));
 
     let fake_primary_addr = network::multiaddr_to_address(fake_primary.address()).unwrap();
     let fake_route =
-        anemo::Router::new().add_rpc_service(PrimaryToPrimaryServer::new(FetchCertificateProxy {
+        anemo::Router::new().add_rpc_service(PrimaryToPrimaryServer::new(NetworkProxy {
             request: tx_fetch_req,
             response: Arc::new(Mutex::new(rx_fetch_resp)),
         }));
@@ -231,30 +207,12 @@ async fn fetch_certificates_basic() {
     let metrics = Arc::new(PrimaryMetrics::new(&Registry::new()));
     let gc_depth: Round = 50;
 
-    // Make a headerWaiter
-    let _header_waiter_handle = HeaderWaiter::spawn(
-        name.clone(),
-        committee.clone(),
-        worker_cache.clone(),
-        certificate_store.clone(),
-        payload_store.clone(),
-        rx_consensus_round_updates.clone(),
-        gc_depth,
-        rx_reconfigure.clone(),
-        rx_header_waiter,
-        tx_headers_loopback,
-        tx_primary_messages.clone(),
-        metrics.clone(),
-        P2pNetwork::new(client_network.clone()),
-    );
-
     // Make a certificate waiter
     let _certificate_waiter_handle = CertificateWaiter::spawn(
         name.clone(),
-        committee.clone(),
+        fixture.committee(),
         P2pNetwork::new(client_network.clone()),
         certificate_store.clone(),
-        Some(consensus_store.clone()),
         rx_consensus_round_updates.clone(),
         gc_depth,
         rx_reconfigure.clone(),
@@ -266,28 +224,27 @@ async fn fetch_certificates_basic() {
     // Spawn the core.
     let _core_handle = Core::spawn(
         name.clone(),
-        committee.clone(),
+        fixture.committee(),
         worker_cache,
         store.header_store.clone(),
         certificate_store.clone(),
-        create_test_vote_store(),
-        synchronizer,
+        synchronizer.clone(),
         signature_service,
         rx_consensus_round_updates,
+        rx_narwhal_round_updates,
         gc_depth,
         rx_reconfigure,
-        /* rx_primaries */ rx_primary_messages,
-        rx_headers_loopback,
+        rx_certificates,
         rx_certificates_loopback,
-        /* rx_proposer */ rx_headers,
+        rx_headers,
         tx_consensus,
-        /* tx_proposer */ tx_parents,
+        tx_parents,
         metrics.clone(),
         P2pNetwork::new(client_network),
     );
 
     // Generate headers and certificates in successive rounds
-    let genesis_certs: Vec<_> = Certificate::genesis(&committee);
+    let genesis_certs: Vec<_> = Certificate::genesis(&fixture.committee());
     for cert in genesis_certs.iter() {
         certificate_store
             .write(cert.clone())
@@ -326,25 +283,21 @@ async fn fetch_certificates_basic() {
             .expect("Writing certificate to store failed");
     }
     let mut num_written = 4;
-    write_last_committed(&committee, &certificate_store, &consensus_store);
 
     // Send a primary message for a certificate with parents that do not exist locally, to trigger fetching.
     let target_index = 123;
-    tx_primary_messages
-        .send(PrimaryMessage::Certificate(
-            certificates[target_index].clone(),
-        ))
+    tx_certificates
+        .send((certificates[target_index].clone(), None))
         .await
         .unwrap();
 
     // Verify the fetch request.
     let mut req = rx_fetch_req.recv().await.unwrap();
-    assert_eq!(
-        req.exclusive_lower_bounds.len(),
-        fixture.authorities().count()
-    );
-    for (_, round) in &req.exclusive_lower_bounds {
-        assert_eq!(round, &1);
+    let (lower_bound, skip_rounds) = req.get_bounds();
+    assert_eq!(lower_bound, 0);
+    assert_eq!(skip_rounds.len(), fixture.authorities().count());
+    for rounds in skip_rounds.values() {
+        assert_eq!(rounds, &(1..2).collect());
     }
 
     // Send back another 62 certificates.
@@ -366,14 +319,14 @@ async fn fetch_certificates_basic() {
     )
     .await;
     num_written += first_batch_len;
-    write_last_committed(&committee, &certificate_store, &consensus_store);
 
     // The certificate waiter should send out another fetch request, because it has not received certificate 123.
     loop {
         match rx_fetch_req.recv().await {
             Some(r) => {
-                if r.exclusive_lower_bounds[0].1 == 1 {
-                    // Drain the fetch requests sent out before the last reply.
+                let (_, skip_rounds) = r.get_bounds();
+                if skip_rounds.values().next().unwrap().len() == 1 {
+                    // Drain the fetch requests sent out before the last reply, when only 1 round in skip_rounds.
                     tx_fetch_resp.try_send(first_batch_resp.clone()).unwrap();
                     continue;
                 }
@@ -383,19 +336,12 @@ async fn fetch_certificates_basic() {
             None => panic!("Unexpected channel closing!"),
         }
     }
-    assert_eq!(
-        req.exclusive_lower_bounds.len(),
-        fixture.authorities().count()
-    );
-    let mut rounds = req
-        .exclusive_lower_bounds
-        .iter()
-        .map(|(_, round)| round)
-        .cloned()
-        .collect_vec();
-    rounds.sort();
-    // Expected rounds are calculated from current num_written index.
-    assert_eq!(rounds, vec![16, 16, 17, 17]);
+    let (_, skip_rounds) = req.get_bounds();
+    assert_eq!(skip_rounds.len(), fixture.authorities().count());
+    for (_, rounds) in skip_rounds {
+        let rounds = rounds.into_iter().collect_vec();
+        assert!(rounds == (1..=16).collect_vec() || rounds == (1..=17).collect_vec());
+    }
 
     // Send back another 123 + 1 - 66 = 58 certificates.
     let second_batch_len = target_index + 1 - num_written;
@@ -416,14 +362,15 @@ async fn fetch_certificates_basic() {
     )
     .await;
     num_written += second_batch_len;
-    write_last_committed(&committee, &certificate_store, &consensus_store);
 
     // No new fetch request is expected.
     sleep(Duration::from_secs(5)).await;
     loop {
         match rx_fetch_req.try_recv() {
             Ok(r) => {
-                if r.exclusive_lower_bounds[0].1 == 16 || r.exclusive_lower_bounds[0].1 == 17 {
+                let (_, skip_rounds) = r.get_bounds();
+                let first_num_skip_rounds = skip_rounds.values().next().unwrap().len();
+                if first_num_skip_rounds == 16 || first_num_skip_rounds == 17 {
                     // Drain the fetch requests sent out before the last reply.
                     tx_fetch_resp.try_send(second_batch_resp.clone()).unwrap();
                     continue;

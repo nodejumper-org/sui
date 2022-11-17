@@ -38,7 +38,7 @@ use sui_types::base_types::{
 use sui_types::committee::EpochId;
 use sui_types::crypto::{AuthorityStrongQuorumSignInfo, SignableBytes, Signature};
 use sui_types::error::SuiError;
-use sui_types::event::{BalanceChangeType, Event};
+use sui_types::event::{BalanceChangeType, Event, EventID};
 use sui_types::event::{EventEnvelope, EventType};
 use sui_types::filter::{EventFilter, TransactionFilter};
 use sui_types::gas::GasCostSummary;
@@ -62,6 +62,8 @@ mod rpc_types_tests;
 
 pub type SuiMoveTypeParameterIndex = u16;
 pub type TransactionsPage = Page<TransactionDigest, TransactionDigest>;
+
+pub type EventPage = Page<SuiEventEnvelope, EventID>;
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema)]
 pub enum SuiMoveAbility {
@@ -791,17 +793,13 @@ impl SuiMoveObject for SuiParsedMoveObject {
     }
 }
 
-impl SuiParsedMoveObject {
-    fn try_type_and_fields_from_move_struct(
-        type_: &StructTag,
-        move_struct: MoveStruct,
-    ) -> Result<(String, SuiMoveStruct), anyhow::Error> {
-        Ok(match move_struct.into() {
-            SuiMoveStruct::WithTypes { type_, fields } => {
-                (type_, SuiMoveStruct::WithFields(fields))
-            }
-            fields => (type_.to_string(), fields),
-        })
+pub fn type_and_fields_from_move_struct(
+    type_: &StructTag,
+    move_struct: MoveStruct,
+) -> (String, SuiMoveStruct) {
+    match move_struct.into() {
+        SuiMoveStruct::WithTypes { type_, fields } => (type_, SuiMoveStruct::WithFields(fields)),
+        fields => (type_.to_string(), fields),
     }
 }
 
@@ -1443,7 +1441,7 @@ impl From<PaySui> for SuiPaySui {
 /// 3. the balance of the first input coin after tx is sum(input_coins) - actual_gas_cost.
 /// 4. all other input coins other than the first are deleted.
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Eq, PartialEq)]
-#[serde(rename = "PaySui")]
+#[serde(rename = "PayAllSui")]
 pub struct SuiPayAllSui {
     /// The coins to be used for payment
     pub coins: Vec<SuiObjectRef>,
@@ -1724,11 +1722,13 @@ impl TryFrom<CertifiedTransaction> for SuiCertifiedTransaction {
     type Error = anyhow::Error;
 
     fn try_from(cert: CertifiedTransaction) -> Result<Self, Self::Error> {
+        let digest = *cert.digest();
+        let (data, sig) = cert.into_data_and_sig();
         Ok(Self {
-            transaction_digest: *cert.digest(),
-            data: cert.signed_data.data.try_into()?,
-            tx_signature: cert.signed_data.tx_signature,
-            auth_sign_info: cert.auth_sign_info,
+            transaction_digest: digest,
+            data: data.data.try_into()?,
+            tx_signature: data.tx_signature,
+            auth_sign_info: sig,
         })
     }
 }
@@ -1774,10 +1774,12 @@ impl SuiCertifiedTransactionEffects {
         cert: CertifiedTransactionEffects,
         resolver: &impl GetModule,
     ) -> Result<Self, anyhow::Error> {
+        let digest = *cert.digest();
+        let (effects, auth_sign_info) = cert.into_data_and_sig();
         Ok(Self {
-            transaction_effects_digest: *cert.digest(),
-            effects: SuiTransactionEffects::try_from(cert.effects, resolver)?,
-            auth_sign_info: cert.auth_signature,
+            transaction_effects_digest: digest,
+            effects: SuiTransactionEffects::try_from(effects, resolver)?,
+            auth_sign_info,
         })
     }
 }
@@ -1974,7 +1976,6 @@ pub struct OwnedObjectRef {
     pub reference: SuiObjectRef,
 }
 
-#[serde_as]
 #[derive(Eq, PartialEq, Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename = "EventEnvelope", rename_all = "camelCase")]
 pub struct SuiEventEnvelope {
@@ -1982,6 +1983,12 @@ pub struct SuiEventEnvelope {
     pub timestamp: u64,
     /// Transaction digest of associated transaction, if any
     pub tx_digest: Option<TransactionDigest>,
+    /// Sequential event ID, ie (transaction seq number, event seq number).
+    /// 1) Serves as a unique event ID for each fullnode
+    /// 2) Also serves to sequence events for the purposes of pagination and querying.
+    ///    A higher id is an event seen later by that fullnode.
+    /// This ID is the "cursor" for event querying.
+    pub id: EventID,
     /// Specific event type
     pub event: SuiEvent,
 }
@@ -2193,10 +2200,7 @@ impl SuiEvent {
                 let (type_, fields) = if let Ok(move_struct) =
                     Event::move_event_to_move_struct(&type_, &contents, resolver)
                 {
-                    let (type_, field) = SuiParsedMoveObject::try_type_and_fields_from_move_struct(
-                        &type_,
-                        move_struct,
-                    )?;
+                    let (type_, field) = type_and_fields_from_move_struct(&type_, move_struct);
                     (type_, Some(field))
                 } else {
                     (type_.to_string(), None)

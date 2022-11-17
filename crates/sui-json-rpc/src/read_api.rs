@@ -7,7 +7,6 @@ use jsonrpsee::core::RpcResult;
 use jsonrpsee_core::server::rpc_module::RpcModule;
 use move_binary_format::normalized::{Module as NormalizedModule, Type};
 use move_core_types::identifier::Identifier;
-use signature::Signature;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use tap::TapFallible;
@@ -24,18 +23,16 @@ use sui_types::base_types::SequenceNumber;
 use sui_types::base_types::{ObjectID, SuiAddress, TransactionDigest};
 use sui_types::batch::TxSequenceNumber;
 use sui_types::committee::EpochId;
-use sui_types::crypto::{SignableBytes, SignatureScheme};
-use sui_types::messages::{
-    CommitteeInfoRequest, CommitteeInfoResponse, Transaction, TransactionData,
-};
+use sui_types::crypto::{sha3_hash, SignableBytes};
+use sui_types::messages::{CommitteeInfoRequest, CommitteeInfoResponse, TransactionData};
 use sui_types::move_package::normalize_modules;
 use sui_types::object::{Data, ObjectRead, Owner};
-use sui_types::query::{Ordering, TransactionQuery};
+use sui_types::query::TransactionQuery;
 
 use tracing::debug;
 
-use crate::api::RpcReadApiServer;
-use crate::api::{RpcFullNodeReadApiServer, MAX_RESULT_SIZE};
+use crate::api::RpcFullNodeReadApiServer;
+use crate::api::{cap_page_limit, RpcReadApiServer};
 use crate::SuiRpcModule;
 
 // An implementation of the read portion of the Gateway JSON-RPC interface intended for use in
@@ -147,31 +144,11 @@ impl SuiRpcModule for ReadApi {
 
 #[async_trait]
 impl RpcFullNodeReadApiServer for FullNodeApi {
-    async fn dry_run_transaction(
-        &self,
-        tx_bytes: Base64,
-        sig_scheme: SignatureScheme,
-        signature: Base64,
-        pub_key: Base64,
-    ) -> RpcResult<SuiTransactionEffects> {
-        let data =
+    async fn dry_run_transaction(&self, tx_bytes: Base64) -> RpcResult<SuiTransactionEffects> {
+        let tx_data =
             TransactionData::from_signable_bytes(&tx_bytes.to_vec().map_err(|e| anyhow!(e))?)?;
-        let flag = vec![sig_scheme.flag()];
-        let signature = Signature::from_bytes(
-            &[
-                &*flag,
-                &*signature.to_vec().map_err(|e| anyhow!(e))?,
-                &pub_key.to_vec().map_err(|e| anyhow!(e))?,
-            ]
-            .concat(),
-        )
-        .map_err(|e| anyhow!(e))?;
-        let txn = Transaction::new(data, signature)
-            .verify()
-            .map_err(|e| anyhow!(e))?;
-        let txn_digest = *txn.digest();
-
-        Ok(self.state.dry_run_transaction(txn, txn_digest).await?)
+        let txn_digest = TransactionDigest::new(sha3_hash(&tx_data));
+        Ok(self.state.dry_exec_transaction(tx_data, txn_digest).await?)
     }
 
     async fn get_normalized_move_modules_by_package(
@@ -286,19 +263,15 @@ impl RpcFullNodeReadApiServer for FullNodeApi {
         query: TransactionQuery,
         cursor: Option<TransactionDigest>,
         limit: Option<usize>,
-        order: Ordering,
+        descending_order: Option<bool>,
     ) -> RpcResult<TransactionsPage> {
-        let limit = limit.unwrap_or(MAX_RESULT_SIZE);
-
-        if limit == 0 {
-            Err(anyhow!("Page result limit must be larger then 0."))?;
-        }
-        let reverse = order == Ordering::Descending;
+        let limit = cap_page_limit(limit)?;
+        let descending = descending_order.unwrap_or_default();
 
         // Retrieve 1 extra item for next cursor
         let mut data = self
             .state
-            .get_transactions(query, cursor, Some(limit + 1), reverse)?;
+            .get_transactions(query, cursor, Some(limit + 1), descending)?;
 
         // extract next cursor
         let next_cursor = data.get(limit).cloned();

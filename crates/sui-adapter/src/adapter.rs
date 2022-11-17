@@ -17,6 +17,7 @@ use move_binary_format::{
     errors::VMResult,
     file_format::{AbilitySet, CompiledModule, LocalIndex, SignatureToken, StructHandleIndex},
 };
+use move_bytecode_verifier::VerifierConfig;
 use move_core_types::{
     account_address::AccountAddress,
     identifier::{IdentStr, Identifier},
@@ -64,7 +65,17 @@ macro_rules! assert_invariant {
 }
 
 pub fn new_move_vm(natives: NativeFunctionTable) -> Result<MoveVM, SuiError> {
-    MoveVM::new(natives).map_err(|_| SuiError::ExecutionInvariantViolation)
+    MoveVM::new_with_verifier_config(
+        natives,
+        VerifierConfig {
+            max_loop_depth: Some(5),
+            treat_friend_as_private: true,
+            max_generic_instantiation_length: Some(32),
+            max_function_parameters: Some(128),
+            max_basic_blocks: Some(1024),
+        },
+    )
+    .map_err(|_| SuiError::ExecutionInvariantViolation)
 }
 
 pub fn new_session<
@@ -618,6 +629,11 @@ fn process_successful_execution<S: Storage + ParentSync>(
             initial_shared_version,
         } = &mut recipient
         {
+            assert_invariant!(
+                old_obj_ver.is_none(),
+                "The object should be guaranteed to be new by \
+                sui::transfer::share_object, which aborts if it is not new"
+            );
             // TODO Consider a distinct Recipient enum within ObjectRuntime to enforce this
             // invariant at the type level.
             assert_eq!(

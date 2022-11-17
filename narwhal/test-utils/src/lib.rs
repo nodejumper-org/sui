@@ -10,11 +10,14 @@ use config::{
 use crypto::{KeyPair, NetworkKeyPair, NetworkPublicKey, PublicKey};
 use fastcrypto::{
     hash::{Digest, Hash as _},
-    traits::{KeyPair as _, Signer as _},
+    traits::{AllowedRng, KeyPair as _, Signer as _},
 };
 use indexmap::IndexMap;
 use multiaddr::Multiaddr;
-use rand::{rngs::OsRng, Rng};
+use rand::{
+    rngs::{OsRng, StdRng},
+    thread_rng, Rng, SeedableRng,
+};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     num::NonZeroUsize,
@@ -25,11 +28,12 @@ use store::{reopen, rocks, rocks::DBMap, Store};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tracing::info;
 use types::{
-    Batch, BatchDigest, Certificate, CertificateDigest, ConsensusStore, FetchCertificatesRequest,
-    FetchCertificatesResponse, GetCertificatesRequest, GetCertificatesResponse, Header,
-    HeaderBuilder, PayloadAvailabilityRequest, PayloadAvailabilityResponse, PrimaryMessage,
-    PrimaryToPrimary, PrimaryToPrimaryServer, PrimaryToWorker, PrimaryToWorkerServer,
-    RequestBatchRequest, RequestBatchResponse, Round, SequenceNumber, Transaction, Vote,
+    Batch, BatchDigest, Certificate, CertificateDigest, CommittedSubDagShell, ConsensusStore,
+    FetchCertificatesRequest, FetchCertificatesResponse, GetCertificatesRequest,
+    GetCertificatesResponse, Header, HeaderBuilder, PayloadAvailabilityRequest,
+    PayloadAvailabilityResponse, PrimaryMessage, PrimaryToPrimary, PrimaryToPrimaryServer,
+    PrimaryToWorker, PrimaryToWorkerServer, RequestBatchRequest, RequestBatchResponse,
+    RequestVoteRequest, RequestVoteResponse, Round, SequenceNumber, Transaction, Vote,
     WorkerBatchMessage, WorkerDeleteBatchesMessage, WorkerReconfigureMessage,
     WorkerSynchronizeMessage, WorkerToWorker, WorkerToWorkerServer,
 };
@@ -39,8 +43,8 @@ pub mod cluster;
 pub const VOTES_CF: &str = "votes";
 pub const HEADERS_CF: &str = "headers";
 pub const CERTIFICATES_CF: &str = "certificates";
-pub const CERTIFICATE_ID_BY_ROUND_CF: &str = "certificate_id_by_round";
-pub const CERTIFICATE_ID_BY_ORIGIN_CF: &str = "certificate_id_by_origin";
+pub const CERTIFICATE_DIGEST_BY_ROUND_CF: &str = "certificate_digest_by_round";
+pub const CERTIFICATE_DIGEST_BY_ORIGIN_CF: &str = "certificate_digest_by_origin";
 pub const PAYLOAD_CF: &str = "payload";
 
 pub fn temp_dir() -> std::path::PathBuf {
@@ -110,7 +114,7 @@ macro_rules! test_new_certificates_channel {
 ////////////////////////////////////////////////////////////////
 
 pub fn random_key() -> KeyPair {
-    KeyPair::generate(&mut OsRng)
+    KeyPair::generate(&mut thread_rng())
 }
 
 ////////////////////////////////////////////////////////////////
@@ -120,16 +124,26 @@ pub fn random_key() -> KeyPair {
 pub fn make_consensus_store(store_path: &std::path::Path) -> Arc<ConsensusStore> {
     const LAST_COMMITTED_CF: &str = "last_committed";
     const SEQUENCE_CF: &str = "sequence";
+    const SUB_DAG_CF: &str = "sub_dag";
 
-    let rocksdb = rocks::open_cf(store_path, None, &[LAST_COMMITTED_CF, SEQUENCE_CF])
-        .expect("Failed creating database");
+    let rocksdb = rocks::open_cf(
+        store_path,
+        None,
+        &[LAST_COMMITTED_CF, SEQUENCE_CF, SUB_DAG_CF],
+    )
+    .expect("Failed creating database");
 
-    let (last_committed_map, sequence_map) = reopen!(&rocksdb,
+    let (last_committed_map, sequence_map, sub_dag_map) = reopen!(&rocksdb,
         LAST_COMMITTED_CF;<PublicKey, Round>,
-        SEQUENCE_CF;<SequenceNumber, CertificateDigest>
+        SEQUENCE_CF;<SequenceNumber, CertificateDigest>,
+        SUB_DAG_CF;<Round, CommittedSubDagShell>
     );
 
-    Arc::new(ConsensusStore::new(last_committed_map, sequence_map))
+    Arc::new(ConsensusStore::new(
+        last_committed_map,
+        sequence_map,
+        sub_dag_map,
+    ))
 }
 
 pub fn fixture_payload(number_of_batches: u8) -> IndexMap<BatchDigest, WorkerId> {
@@ -198,6 +212,12 @@ impl PrimaryToPrimary for PrimaryToPrimaryMockServer {
         Ok(anemo::Response::new(()))
     }
 
+    async fn request_vote(
+        &self,
+        _request: anemo::Request<RequestVoteRequest>,
+    ) -> Result<anemo::Response<RequestVoteResponse>, anemo::rpc::Status> {
+        unimplemented!()
+    }
     async fn get_certificates(
         &self,
         _request: anemo::Request<GetCertificatesRequest>,
@@ -210,6 +230,7 @@ impl PrimaryToPrimary for PrimaryToPrimaryMockServer {
     ) -> Result<anemo::Response<FetchCertificatesResponse>, anemo::rpc::Status> {
         unimplemented!()
     }
+
     async fn get_payload_availability(
         &self,
         _request: anemo::Request<PayloadAvailabilityRequest>,
@@ -611,13 +632,17 @@ impl<R: rand::RngCore + rand::CryptoRng> Builder<R> {
     pub fn build(mut self) -> CommitteeFixture {
         let authorities = (0..self.committee_size.get())
             .map(|_| {
-                AuthorityFixture::generate(&mut self.rng, self.number_of_workers, |host| {
-                    if self.randomize_ports {
-                        get_available_port(host)
-                    } else {
-                        0
-                    }
-                })
+                AuthorityFixture::generate(
+                    StdRng::from_rng(&mut self.rng).unwrap(),
+                    self.number_of_workers,
+                    |host| {
+                        if self.randomize_ports {
+                            get_available_port(host)
+                        } else {
+                            0
+                        }
+                    },
+                )
             })
             .collect();
 
@@ -746,8 +771,11 @@ impl CommitteeFixture {
 
     /// Add a new authority to the commit by randoming generating a key
     pub fn add_authority(&mut self) {
-        let authority =
-            AuthorityFixture::generate(OsRng, NonZeroUsize::new(4).unwrap(), get_available_port);
+        let authority = AuthorityFixture::generate(
+            StdRng::from_rng(OsRng).unwrap(),
+            NonZeroUsize::new(4).unwrap(),
+            get_available_port,
+        );
         self.authorities.push(authority)
     }
 
@@ -855,7 +883,7 @@ impl AuthorityFixture {
 
     fn generate<R, P>(mut rng: R, number_of_workers: NonZeroUsize, mut get_port: P) -> Self
     where
-        R: rand::RngCore + rand::CryptoRng,
+        R: AllowedRng,
         P: FnMut(&str) -> u16,
     {
         let keypair = KeyPair::generate(&mut rng);
@@ -907,12 +935,12 @@ impl WorkerFixture {
             .unwrap()
     }
 
-    fn generate<R, P>(mut rng: R, id: WorkerId, mut get_port: P) -> Self
+    fn generate<R, P>(rng: R, id: WorkerId, mut get_port: P) -> Self
     where
         R: rand::RngCore + rand::CryptoRng,
         P: FnMut(&str) -> u16,
     {
-        let keypair = NetworkKeyPair::generate(&mut rng);
+        let keypair = NetworkKeyPair::generate(&mut StdRng::from_rng(rng).unwrap());
         let worker_name = keypair.public().clone();
         let host = "127.0.0.1";
         let worker_address = format!("/ip4/{}/tcp/{}/http", host, get_port(host))
@@ -945,7 +973,7 @@ pub fn test_network(keypair: NetworkKeyPair, address: &Multiaddr) -> anemo::Netw
 }
 
 pub fn random_network() -> anemo::Network {
-    let network_key = NetworkKeyPair::generate(&mut OsRng);
+    let network_key = NetworkKeyPair::generate(&mut StdRng::from_rng(OsRng).unwrap());
     let address = "/ip4/127.0.0.1/udp/0".parse().unwrap();
     test_network(network_key, &address)
 }

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { ObjectOwner, SuiAddress, TransactionDigest } from './common';
+import { isTransactionEffects } from './index.guard';
 import { ObjectId, SuiMovePackage, SuiObject, SuiObjectRef } from './objects';
 
 export type TransferObject = {
@@ -187,8 +188,6 @@ export type TransactionQuery =
   | { MutatedObject: ObjectId }
   | { FromAddress: SuiAddress }
   | { ToAddress: SuiAddress };
-
-export type Ordering = 'Ascending' | 'Descending';
 
 export type MoveCall = {
   package: SuiObjectRef;
@@ -396,13 +395,16 @@ export function getExecutionStatusError(
 }
 
 export function getExecutionStatusGasSummary(
-  data: SuiTransactionResponse | SuiExecuteTransactionResponse
+  data: SuiTransactionResponse | SuiExecuteTransactionResponse | TransactionEffects
 ): GasCostSummary | undefined {
+  if (isTransactionEffects(data)) {
+    return data.gasUsed;
+  }
   return getTransactionEffects(data)?.gasUsed;
 }
 
 export function getTotalGasUsed(
-  data: SuiTransactionResponse | SuiExecuteTransactionResponse
+  data: SuiTransactionResponse | SuiExecuteTransactionResponse | TransactionEffects
 ): number | undefined {
   const gasSummary = getExecutionStatusGasSummary(data);
   return gasSummary

@@ -4,15 +4,14 @@
 use std::sync::Arc;
 
 use axum::{Extension, Json};
-use fastcrypto::encoding::Hex;
-
-use sui_types::base_types::{encode_bytes_hex, SuiAddress};
+use fastcrypto::encoding::{Encoding, Hex};
+use sui_types::base_types::SuiAddress;
 use sui_types::crypto;
 use sui_types::crypto::{SignableBytes, SignatureScheme, ToFromBytes};
 use sui_types::gas_coin::GasCoin;
 use sui_types::messages::{
-    QuorumDriverRequest, QuorumDriverRequestType, QuorumDriverResponse, Transaction,
-    TransactionData,
+    QuorumDriverRequest, QuorumDriverRequestType, QuorumDriverResponse, SenderSignedData,
+    Transaction, TransactionData,
 };
 use sui_types::object::Owner;
 
@@ -61,7 +60,7 @@ pub async fn payloads(
         .ok_or_else(|| Error::new(ErrorType::MissingMetadata))?;
 
     let data = Operation::create_data(request.operations, metadata).await?;
-    let hex_bytes = encode_bytes_hex(data.to_bytes());
+    let hex_bytes = Hex::encode(data.to_bytes());
 
     Ok(ConstructionPayloadsResponse {
         unsigned_transaction: Hex::from_bytes(&data.to_bytes()),
@@ -102,11 +101,11 @@ pub async fn combine(
     }
     .flag()];
 
-    let signed_tx = Transaction::new(
+    let signed_tx = Transaction::new(SenderSignedData::new(
         data,
         crypto::Signature::from_bytes(&[&*flag, &*sig_bytes, &*pub_key].concat())?,
-    );
-    signed_tx.verify_sender_signature()?;
+    ));
+    signed_tx.verify_signature()?;
     let signed_tx_bytes = bcs::to_bytes(&signed_tx)?;
 
     Ok(ConstructionCombineResponse {
@@ -243,7 +242,7 @@ pub async fn parse(
                 .to_vec()
                 .map_err(|e| anyhow::anyhow!(e))?,
         )?;
-        tx.signed_data.data
+        tx.into_data().data
     } else {
         TransactionData::from_signable_bytes(
             &request

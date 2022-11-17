@@ -68,10 +68,10 @@ module sui::sui_system {
     const ECANNOT_REPORT_ONESELF: u64 = 3;
     const EREPORT_RECORD_NOT_FOUND: u64 = 4;
 
-    // ==== functions that can only be called by Genesis ====
+    // ==== functions that can only be called by genesis ====
 
     /// Create a new SuiSystemState object and make it shared.
-    /// This function will be called only once in Genesis.
+    /// This function will be called only once in genesis.
     public(friend) fun create(
         validators: vector<Validator>,
         sui_supply: Supply<SUI>,
@@ -116,6 +116,7 @@ module sui::sui_system {
         net_address: vector<u8>,
         stake: Coin<SUI>,
         gas_price: u64,
+        commission_rate: u64,
         ctx: &mut TxContext,
     ) {
         assert!(
@@ -137,6 +138,7 @@ module sui::sui_system {
             coin::into_balance(stake),
             option::none(),
             gas_price,
+            commission_rate,
             ctx
         );
 
@@ -168,6 +170,19 @@ module sui::sui_system {
         validator_set::request_set_gas_price(
             &mut self.validators,
             new_gas_price,
+            ctx
+        )
+    }
+
+    /// A validator can call this entry function to set a new commission rate, updated at the end of the epoch.
+    public entry fun request_set_commission_rate(
+        self: &mut SuiSystemState,
+        new_commission_rate: u64,
+        ctx: &mut TxContext,
+    ) {
+        validator_set::request_set_commission_rate(
+            &mut self.validators,
+            new_commission_rate,
             ctx
         )
     }
@@ -221,6 +236,7 @@ module sui::sui_system {
         )
     }
 
+    /// Add delegated stake to a validator's staking pool.
     public entry fun request_add_delegation(
         self: &mut SuiSystemState,
         delegate_stake: Coin<SUI>,
@@ -236,6 +252,7 @@ module sui::sui_system {
         );
     }
 
+    /// Add delegated stake to a validator's staking pool using a locked SUI coin.
     public entry fun request_add_delegation_with_locked_coin(
         self: &mut SuiSystemState,
         delegate_stake: LockedCoin<SUI>,
@@ -246,6 +263,7 @@ module sui::sui_system {
         validator_set::request_add_delegation(&mut self.validators, validator_address, balance, option::some(lock), ctx);
     }
 
+    /// Withdraw some portion of a delegation from a validator's staking pool.
     public entry fun request_withdraw_delegation(
         self: &mut SuiSystemState,
         delegation: &mut Delegation,
@@ -265,12 +283,15 @@ module sui::sui_system {
     // Switch delegation from the current validator to a new one.
     public entry fun request_switch_delegation(
         self: &mut SuiSystemState,
-        delegation: Delegation,
+        delegation: &mut Delegation,
         staked_sui: &mut StakedSui,
         new_validator_address: address,
+        switch_pool_token_amount: u64,
         ctx: &mut TxContext,
     ) {
-        validator_set::request_switch_delegation(&mut self.validators, delegation, staked_sui, new_validator_address, ctx);
+        validator_set::request_switch_delegation(
+            &mut self.validators, delegation, staked_sui, new_validator_address, switch_pool_token_amount, ctx
+        );
     }
 
     /// Report a validator as a bad or non-performant actor in the system.

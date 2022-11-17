@@ -23,13 +23,15 @@ import {
   TransactionDigest,
   ObjectId,
   SuiAddress,
-  ObjectOwner,
-  SuiEvents,
+  EventQuery,
+  EventId,
   PaginatedTransactionDigests,
   TransactionQuery,
-  Ordering,
+  PaginatedEvents,
   RpcApiVersion,
   FaucetResponse,
+  Order,
+  TransactionEffects,
 } from '../types';
 
 ///////////////////////////////
@@ -159,7 +161,7 @@ export abstract class Provider {
     query: TransactionQuery,
     cursor: TransactionDigest | null,
     limit: number | null,
-    order: Ordering
+    order: Order
   ): Promise<PaginatedTransactionDigests>;
 
   /**
@@ -173,7 +175,7 @@ export abstract class Provider {
    * replace the other `executeTransaction` that's only available on the
    * Gateway
    */
-  abstract executeTransactionWithRequestType(
+  abstract executeTransaction(
     txnBytes: string,
     signatureScheme: SignatureScheme,
     signature: string,
@@ -226,98 +228,18 @@ export abstract class Provider {
   ): Promise<SuiMoveNormalizedStruct>;
 
   /**
-   * Get events for one transaction
-   * @param digest transaction digest to search by
-   * @param count max result count
+   * Get events for a given query criteria
+   * @param query - the event query criteria.
+   * @param cursor - optional paging cursor
+   * @param limit - maximum number of items per page
+   * @param order - event query ordering
    */
-  abstract getEventsByTransaction(
-    digest: TransactionDigest,
-    count: number
-  ): Promise<SuiEvents>;
-
-  /**
-   * Get events emitted from within the specified Move module
-   * @param package_ Move package object ID
-   * @param module Move module name
-   * @param count max result count
-   * @param startTime start of time range
-   * @param endTime end of time range, exclusive
-   */
-  abstract getEventsByModule(
-    packageId: ObjectId,
-    module: string,
-    count: number,
-    startTime: number,
-    endTime: number
-  ): Promise<SuiEvents>;
-
-  /**
-   * Get events with a matching Move type name
-   * @param moveEventStructName Move struct type name
-   * @param count max result count
-   * @param startTime start of time range to search
-   * @param endTime end of time range
-   */
-  abstract getEventsByMoveEventStructName(
-    moveEventStructName: string,
-    count: number,
-    startTime: number,
-    endTime: number
-  ): Promise<SuiEvents>;
-
-  /**
-   * Get events from transactions sent by a specific address
-   * @param sender Sui address of the sender of the transaction that generated the event
-   * @param count max result count
-   * @param startTime start of time range to search
-   * @param endTime end of time range
-   */
-  abstract getEventsBySender(
-    sender: SuiAddress,
-    count: number,
-    startTime: number,
-    endTime: number
-  ): Promise<SuiEvents>;
-
-  /**
-   * Get events with a matching recipient
-   * @param recipient object owner that received the transaction that generated the event
-   * @param count max result count
-   * @param startTime start of time range to search
-   * @param endTime end of time range
-   */
-  abstract getEventsByRecipient(
-    recipient: ObjectOwner,
-    count: number,
-    startTime: number,
-    endTime: number
-  ): Promise<SuiEvents>;
-
-  /**
-   * Get events involving the given object
-   * @param object object id created, mutated, or deleted in events
-   * @param count max result count
-   * @param startTime start of time range to search
-   * @param endTime end of time range
-   */
-  abstract getEventsByObject(
-    object: ObjectId,
-    count: number,
-    startTime: number,
-    endTime: number
-  ): Promise<SuiEvents>;
-
-  /**
-   * Get all events within the given time span
-   * @param count max result count
-   * @param startTime start of time range to search
-   * @param endTime end of time range
-   */
-  abstract getEventsByTimeRange(
-    count: number,
-    startTime: number,
-    endTime: number
-  ): Promise<SuiEvents>;
+  abstract getEvents(
+      query: EventQuery,
+      cursor: EventId | null,
+      limit: number | null,
+      order: Order,
+  ): Promise<PaginatedEvents>;
 
   /**
    * Subscribe to get notifications whenever an event matching the filter occurs
@@ -335,4 +257,6 @@ export abstract class Provider {
    */
   abstract unsubscribeEvent(id: SubscriptionId): Promise<boolean>;
   // TODO: add more interface methods
+
+  abstract dryRunTransaction(txBytes: string): Promise<TransactionEffects>;
 }

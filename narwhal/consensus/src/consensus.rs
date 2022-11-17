@@ -4,7 +4,7 @@
 
 #![allow(clippy::mutable_key_type)]
 
-use crate::{metrics::ConsensusMetrics, ConsensusOutput, SequenceNumber};
+use crate::{metrics::ConsensusMetrics, SequenceNumber};
 use config::Committee;
 use crypto::PublicKey;
 use fastcrypto::hash::Hash;
@@ -18,9 +18,13 @@ use sui_metrics::spawn_monitored_task;
 use tokio::{sync::watch, task::JoinHandle};
 use tracing::{debug, info, instrument};
 use types::{
-    metered_channel, Certificate, CertificateDigest, ConsensusStore, ReconfigureNotification,
-    Round, StoreResult, Timestamp,
+    metered_channel, Certificate, CertificateDigest, CommittedSubDag, ConsensusStore,
+    ReconfigureNotification, Round, StoreResult, Timestamp,
 };
+
+#[cfg(test)]
+#[path = "tests/consensus_tests.rs"]
+pub mod consensus_tests;
 
 /// The representation of the DAG in memory.
 pub type Dag = HashMap<Round, HashMap<PublicKey, (CertificateDigest, Certificate)>>;
@@ -67,11 +71,6 @@ impl ConsensusState {
         cert_store: CertificateStore,
         gc_depth: Round,
     ) -> Self {
-        // We return a bool here which is always true to use as a "recovery token". This
-        // allows us to ensure that the primary is spawned only after the
-        // consensus is guaranteed to be in a state where it can process messages it
-        // receives from the primary when the primary starts up. We do this by passing the
-        // recovery token generated here and checking it before the primary spawn method.
         let last_committed_round = *recover_last_committed
             .iter()
             .max_by(|a, b| a.1.cmp(b.1))
@@ -83,7 +82,12 @@ impl ConsensusState {
         }
         metrics.recovered_consensus_state.inc();
 
-        let dag = Self::construct_dag_from_cert_store(cert_store, last_committed_round, gc_depth);
+        let dag = Self::construct_dag_from_cert_store(
+            cert_store,
+            last_committed_round,
+            &recover_last_committed,
+            gc_depth,
+        );
 
         Self {
             last_committed_round,
@@ -97,30 +101,25 @@ impl ConsensusState {
     pub fn construct_dag_from_cert_store(
         cert_store: CertificateStore,
         last_committed_round: Round,
+        last_committed: &HashMap<PublicKey, Round>,
         gc_depth: Round,
     ) -> Dag {
         let mut dag: Dag = HashMap::new();
+        let min_round = last_committed_round.saturating_sub(gc_depth);
+
         info!(
-            "Recreating dag from last committed round: {}",
-            last_committed_round
+            "Recreating dag from last committed round: {}, min_round: {}",
+            last_committed_round, min_round
         );
 
-        let min_round = last_committed_round.saturating_sub(gc_depth);
         // get all certificates at a round > min_round
-        let cert_map = cert_store.after_round(min_round + 1).unwrap();
+        let certificates = cert_store.after_round(min_round + 1).unwrap();
 
-        let num_certs = cert_map.len();
-        for (digest, cert) in cert_map.into_iter().map(|c| (c.digest(), c)) {
-            let inner = dag.get_mut(&cert.header.round);
-            match inner {
-                Some(m) => {
-                    m.insert(cert.header.author.clone(), (digest, cert.clone()));
-                }
-                None => {
-                    dag.entry(cert.header.round)
-                        .or_insert_with(HashMap::new)
-                        .insert(cert.header.author.clone(), (digest, cert.clone()));
-                }
+        let mut num_certs = 0;
+        for cert in &certificates {
+            if Self::try_insert_in_dag(&mut dag, last_committed, cert).is_ok() {
+                info!("Inserted certificate: {:?}", cert);
+                num_certs += 1;
             }
         }
         info!(
@@ -133,25 +132,35 @@ impl ConsensusState {
     }
 
     #[allow(clippy::result_unit_err)]
-    pub fn try_insert(&mut self, certificate: Certificate) -> Result<(), ()> {
-        let last_committed = self
-            .last_committed
+    pub fn try_insert(&mut self, certificate: &Certificate) -> Result<(), ()> {
+        Self::try_insert_in_dag(&mut self.dag, &self.last_committed, certificate)
+    }
+
+    #[allow(clippy::result_unit_err)]
+    fn try_insert_in_dag(
+        dag: &mut Dag,
+        last_committed: &HashMap<PublicKey, Round>,
+        certificate: &Certificate,
+    ) -> Result<(), ()> {
+        let last_committed_round = last_committed
             .get(&certificate.origin())
             .cloned()
             .unwrap_or_default();
-        if certificate.round() < last_committed {
+        if certificate.round() < last_committed_round {
             debug!(
                 "Ignoring certificate {:?} as it is past last committed round for this origin {}",
-                certificate, last_committed
+                certificate, last_committed_round
             );
-            Err(())
-        } else {
-            self.dag
-                .entry(certificate.round())
-                .or_insert_with(HashMap::new)
-                .insert(certificate.origin(), (certificate.digest(), certificate));
-            Ok(())
+            return Err(());
         }
+
+        dag.entry(certificate.round())
+            .or_insert_with(HashMap::new)
+            .insert(
+                certificate.origin(),
+                (certificate.digest(), certificate.clone()),
+            );
+        Ok(())
     }
 
     /// Update and clean up internal state base on committed certificates.
@@ -197,7 +206,7 @@ pub trait ConsensusProtocol {
         consensus_index: SequenceNumber,
         // The new certificate.
         certificate: Certificate,
-    ) -> StoreResult<Vec<ConsensusOutput>>;
+    ) -> StoreResult<Vec<CommittedSubDag>>;
 
     fn update_committee(&mut self, new_committee: Committee) -> StoreResult<()>;
 }
@@ -212,9 +221,9 @@ pub struct Consensus<ConsensusProtocol> {
     /// if it already sent us its whole history.
     rx_new_certificates: metered_channel::Receiver<Certificate>,
     /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
-    tx_committed_certificates: metered_channel::Sender<Certificate>,
+    tx_committed_certificates: metered_channel::Sender<(Round, Vec<Certificate>)>,
     /// Outputs the sequence of ordered certificates to the application layer.
-    tx_sequence: metered_channel::Sender<ConsensusOutput>,
+    tx_sequence: metered_channel::Sender<CommittedSubDag>,
 
     /// The (global) consensus index. We assign one index to each sequenced certificate. this is
     /// helpful for clients.
@@ -241,8 +250,8 @@ where
         cert_store: CertificateStore,
         rx_reconfigure: watch::Receiver<ReconfigureNotification>,
         rx_new_certificates: metered_channel::Receiver<Certificate>,
-        tx_committed_certificates: metered_channel::Sender<Certificate>,
-        tx_sequence: metered_channel::Sender<ConsensusOutput>,
+        tx_committed_certificates: metered_channel::Sender<(Round, Vec<Certificate>)>,
+        tx_sequence: metered_channel::Sender<CommittedSubDag>,
         protocol: Protocol,
         metrics: Arc<ConsensusMetrics>,
         gc_depth: Round,
@@ -322,46 +331,61 @@ where
                     }
 
                     // Process the certificate using the selected consensus protocol.
-                    let sequence =
+                    let commit_round_leader = certificate.header.round;
+                    let committed_sub_dags =
                         self.protocol
                             .process_certificate(&mut self.state, self.consensus_index, certificate)?;
 
                     // Update the consensus index.
-                    self.consensus_index += sequence.len() as u64;
+                    let total_commits: usize = committed_sub_dags.iter().map(|x| x.len()).sum();
+                    self.consensus_index += total_commits as u64;
+
+                    // We extract a list of headers from this specific validator that
+                    // have been agreed upon, and signal this back to the narwhal sub-system
+                    // to be used to re-send batches that have not made it to a commit.
+                    let mut commited_certificates = Vec::new();
 
                     // Output the sequence in the right order.
-                    for output in sequence {
-                        let certificate = &output.certificate;
-                        tracing::debug!("Commit in Sequence {:?}", output);
+                    for committed_sub_dag in committed_sub_dags {
+                        for output in &committed_sub_dag.certificates {
+                            let certificate = &output.certificate;
+                            tracing::debug!("Commit in Sequence {:?}", output);
 
-                        #[cfg(not(feature = "benchmark"))]
-                        if output.consensus_index % 5_000 == 0 {
-                            tracing::debug!("Committed {}", certificate.header);
+                            #[cfg(not(feature = "benchmark"))]
+                            if output.consensus_index % 5_000 == 0 {
+                                tracing::debug!("Committed {}", certificate.header);
+                            }
+
+                            #[cfg(feature = "benchmark")]
+                            for digest in certificate.header.payload.keys() {
+                                // NOTE: This log entry is used to compute performance.
+                                tracing::info!("Committed {} -> {:?}", certificate.header, digest);
+                            }
+
+                            // Update DAG size metric periodically to limit computation cost.
+                            // TODO: this should be triggered on collection when library support for
+                            // closure metrics is available.
+                            if output.consensus_index % 1_000 == 0 {
+                                self.metrics
+                                    .dag_size_bytes
+                                    .set((mysten_util_mem::malloc_size(&self.state.dag) + std::mem::size_of::<Dag>()) as i64);
+                            }
+
+                            commited_certificates.push(output.certificate.clone());
                         }
 
-                        #[cfg(feature = "benchmark")]
-                        for digest in certificate.header.payload.keys() {
-                            // NOTE: This log entry is used to compute performance.
-                            tracing::info!("Committed {} -> {:?}", certificate.header, digest);
+                        // NOTE: The size of the sub-dag can be arbitrarily large (depending on the network condition
+                        // and Byzantine leaders).
+                        if let Err(e) = self.tx_sequence.send(committed_sub_dag).await {
+                            tracing::warn!("Failed to output sub dag: {e}");
                         }
+                    }
 
-                        // Update DAG size metric periodically to limit computation cost.
-                        // TODO: this should be triggered on collection when library support for
-                        // closure metrics is available.
-                        if output.consensus_index % 1_000 == 0 {
-                            self.metrics
-                                .dag_size_bytes
-                                .set((mysten_util_mem::malloc_size(&self.state.dag) + std::mem::size_of::<Dag>()) as i64);
-                        }
-
+                    if !commited_certificates.is_empty(){
                         self.tx_committed_certificates
-                            .send(certificate.clone())
-                            .await
-                            .expect("Failed to send certificate to primary");
-
-                        if let Err(e) = self.tx_sequence.send(output).await {
-                            tracing::warn!("Failed to output certificate: {e}");
-                        }
+                        .send((commit_round_leader, commited_certificates))
+                        .await
+                        .expect("Failed to send certificate to primary");
                     }
 
                     self.metrics

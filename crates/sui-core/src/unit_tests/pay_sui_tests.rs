@@ -22,7 +22,7 @@ async fn test_pay_sui_failure_empty_recipients() {
 
     let res = execute_pay_sui(vec![coin1], vec![], vec![], sender, sender_key, 100).await;
 
-    let effects = res.txn_result.unwrap().signed_effects.unwrap().effects;
+    let effects = res.txn_result.unwrap().signed_effects.unwrap().into_data();
     assert_eq!(
         effects.status,
         ExecutionStatus::new_failure(ExecutionFailureStatus::EmptyRecipients)
@@ -46,7 +46,7 @@ async fn test_pay_sui_failure_arity_mismatch() {
     )
     .await;
 
-    let effects = res.txn_result.unwrap().signed_effects.unwrap().effects;
+    let effects = res.txn_result.unwrap().signed_effects.unwrap().into_data();
     assert_eq!(
         effects.status,
         ExecutionStatus::new_failure(ExecutionFailureStatus::RecipientsAmountsArityMismatch)
@@ -195,7 +195,7 @@ async fn test_pay_sui_success_one_input_coin() -> anyhow::Result<()> {
     )
     .await;
 
-    let effects = res.txn_result.unwrap().signed_effects.unwrap().effects;
+    let effects = res.txn_result.unwrap().signed_effects.unwrap().into_data();
     assert_eq!(effects.status, ExecutionStatus::Success);
     // make sure each recipient receives the specified amount
     assert_eq!(effects.created.len(), 3);
@@ -274,7 +274,7 @@ async fn test_pay_sui_success_multiple_input_coins() -> anyhow::Result<()> {
     .await;
     let recipient_amount_map: HashMap<_, u64> =
         HashMap::from([(recipient1, 500), (recipient2, 1500)]);
-    let effects = res.txn_result.unwrap().signed_effects.unwrap().effects;
+    let effects = res.txn_result.unwrap().signed_effects.unwrap().into_data();
     assert_eq!(effects.status, ExecutionStatus::Success);
 
     // make sure each recipient receives the specified amount
@@ -369,7 +369,7 @@ async fn test_pay_all_sui_success_one_input_coin() -> anyhow::Result<()> {
     let recipient = dbg_addr(2);
     let res = execute_pay_all_sui(vec![&coin_obj], recipient, sender, sender_key, 1000).await;
 
-    let effects = res.txn_result.unwrap().signed_effects.unwrap().effects;
+    let effects = res.txn_result.unwrap().signed_effects.unwrap().into_data();
     assert_eq!(effects.status, ExecutionStatus::Success);
 
     // make sure the first object now belongs to the recipient,
@@ -401,7 +401,7 @@ async fn test_pay_all_sui_success_multiple_input_coins() -> anyhow::Result<()> {
     )
     .await;
 
-    let effects = res.txn_result.unwrap().signed_effects.unwrap().effects;
+    let effects = res.txn_result.unwrap().signed_effects.unwrap().into_data();
     assert_eq!(effects.status, ExecutionStatus::Success);
 
     // make sure the first object now belongs to the recipient,
@@ -450,7 +450,7 @@ async fn execute_pay_sui(
     let data = TransactionData::new_with_gas_price(kind, sender, gas_object_ref, gas_budget, 1);
 
     let signature = Signature::new(&data, &sender_key);
-    let tx = Transaction::new(data, signature).verify().unwrap();
+    let tx = Transaction::from_data(data, signature).verify().unwrap();
     let txn_result = send_and_confirm_transaction(&authority_state, tx)
         .await
         .map(|t| t.into());
@@ -485,7 +485,7 @@ async fn execute_pay_all_sui(
     }));
     let data = TransactionData::new_with_gas_price(kind, sender, gas_object_ref, gas_budget, 1);
     let signature = Signature::new(&data, &sender_key);
-    let tx = Transaction::new(data, signature).verify().unwrap();
+    let tx = Transaction::from_data(data, signature).verify().unwrap();
 
     let txn_result = send_and_confirm_transaction(&authority_state, tx)
         .await

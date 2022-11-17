@@ -1,6 +1,68 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::authority_client::NetworkAuthorityClientMetrics;
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use sui_network::tonic;
+
+#[async_trait]
+pub trait Reconfigurable {
+    fn needs_network_recreation() -> bool;
+
+    fn recreate(
+        channel: tonic::transport::Channel,
+        metrics: Arc<NetworkAuthorityClientMetrics>,
+    ) -> Self;
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum ReconfigCertStatus {
+    AcceptAllCerts,
+    RejectUserCerts,
+    RejectAllCerts,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ReconfigState {
+    status: ReconfigCertStatus,
+}
+
+impl Default for ReconfigState {
+    fn default() -> Self {
+        Self {
+            status: ReconfigCertStatus::AcceptAllCerts,
+        }
+    }
+}
+
+impl ReconfigState {
+    pub fn close_user_certs(&mut self) {
+        if matches!(self.status, ReconfigCertStatus::AcceptAllCerts) {
+            self.status = ReconfigCertStatus::RejectUserCerts;
+        }
+    }
+
+    pub fn close_all_certs(&mut self) {
+        self.status = ReconfigCertStatus::RejectAllCerts;
+    }
+
+    pub fn open_all_certs(&mut self) {
+        self.status = ReconfigCertStatus::AcceptAllCerts;
+    }
+
+    pub fn should_accept_user_certs(&self) -> bool {
+        matches!(self.status, ReconfigCertStatus::AcceptAllCerts)
+    }
+
+    pub fn should_accept_consensus_certs(&self) -> bool {
+        !matches!(self.status, ReconfigCertStatus::RejectAllCerts)
+    }
+}
+
+/*
+
 use crate::authority_active::ActiveAuthority;
 use crate::authority_aggregator::AuthorityAggregator;
 use crate::authority_client::{AuthorityAPI, NetworkAuthorityClientMetrics};
@@ -19,16 +81,6 @@ use sui_types::messages::VerifiedSignedTransaction;
 use sui_types::sui_system_state::SuiSystemState;
 use tracing::{debug, error, info, warn};
 use typed_store::Map;
-
-#[async_trait]
-pub trait Reconfigurable {
-    fn needs_network_recreation() -> bool;
-
-    fn recreate(
-        channel: tonic::transport::Channel,
-        metrics: Arc<NetworkAuthorityClientMetrics>,
-    ) -> Self;
-}
 
 const WAIT_BETWEEN_QUORUM_QUERY_RETRY: Duration = Duration::from_millis(300);
 
@@ -85,8 +137,11 @@ where
 
             // Delete any extra certificates now unprocessed.
             checkpoints.tables.extra_transactions.clear()?;
-
-            self.state.database.remove_all_pending_certificates()?;
+            // This is either unnecessary if the whole epoch database will be dropped, or
+            // in correct if the table can contain certificates from multiple epochs.
+            // TODO: fix this during reconfiguration work.
+            self.state.database.cleanup_pending_certificates()?;
+            // TODO: also clean up self.node_sync_store for epoch - 1.
 
             let (storage_charges, computation_charges, storage_rebates): (
                 Vec<u64>,
@@ -168,7 +223,7 @@ where
             let err = match self
                 .net
                 .load()
-                .process_transaction(advance_epoch_tx.clone().to_transaction())
+                .process_transaction(advance_epoch_tx.clone().into_unsigned())
                 .await
             {
                 Ok(certificate) => match self.state.handle_certificate(&certificate).await {
@@ -288,3 +343,4 @@ where
         Ok(())
     }
 }
+ */

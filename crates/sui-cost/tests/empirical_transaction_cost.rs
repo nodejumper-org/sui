@@ -258,7 +258,7 @@ async fn run_actual_and_estimate_costs(
 
     for (tx_type, tx) in tx_map {
         let gas_used = if tx_type.is_shared_object_tx() {
-            submit_shared_object_transaction(tx.clone(), &configs.validator_set()[0..1])
+            submit_shared_object_transaction(tx.clone(), configs.validator_set())
                 .await
                 .unwrap()
                 .gas_cost_summary()
@@ -274,7 +274,7 @@ async fn run_actual_and_estimate_costs(
             .with_async(|node| async move {
                 let state = node.state();
                 estimate_transaction_computation_cost(
-                    tx.into_inner().signed_data.data,
+                    tx.into_inner().into_data().data,
                     state.clone(),
                     None,
                     None,

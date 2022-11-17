@@ -49,6 +49,8 @@ module sui::validator {
         next_epoch_delegation: u64,
         /// This validator's gas price quote for the next epoch.
         next_epoch_gas_price: u64,
+        /// The commission rate of the validator starting the next epoch, in basis point.
+        next_epoch_commission_rate: u64,
     }
 
     struct Validator has store {
@@ -65,6 +67,8 @@ module sui::validator {
         gas_price: u64,
         /// Staking pool for the stakes delegated to this validator.
         delegation_staking_pool: StakingPool,
+        /// Commission rate of the validator, in basis point.
+        commission_rate: u64,
     }
 
     const PROOF_OF_POSSESSION_DOMAIN: vector<u8> = vector[107, 111, 115, 107];
@@ -96,6 +100,7 @@ module sui::validator {
         stake: Balance<SUI>,
         coin_locked_until_epoch: Option<EpochTimeLock>,
         gas_price: u64,
+        commission_rate: u64,
         ctx: &mut TxContext
     ): Validator {
         assert!(
@@ -123,12 +128,14 @@ module sui::validator {
                 next_epoch_stake: stake_amount,
                 next_epoch_delegation: 0,
                 next_epoch_gas_price: gas_price,
+                next_epoch_commission_rate: commission_rate,
             },
             stake_amount,
             pending_stake: 0,
             pending_withdraw: 0,
             gas_price,
             delegation_staking_pool: staking_pool::new(sui_address, tx_context::epoch(ctx) + 1),
+            commission_rate,
         }
     }
 
@@ -140,6 +147,7 @@ module sui::validator {
             pending_withdraw: _,
             gas_price: _,
             delegation_staking_pool,
+            commission_rate: _,
         } = self;
         staking_pool::deactivate_staking_pool(delegation_staking_pool, ctx);
     }
@@ -175,32 +183,31 @@ module sui::validator {
         stake::withdraw_stake(stake, withdraw_amount, ctx);
     }
 
-    /// Process pending stake and pending withdraws.
+    /// Process pending stake and pending withdraws, and update the gas price.
     public(friend) fun adjust_stake_and_gas_price(self: &mut Validator) {
         self.stake_amount = self.stake_amount + self.pending_stake - self.pending_withdraw;
         self.pending_stake = 0;
         self.pending_withdraw = 0;
         self.gas_price = self.metadata.next_epoch_gas_price;
+        self.commission_rate = self.metadata.next_epoch_commission_rate;
         assert!(self.stake_amount == self.metadata.next_epoch_stake, 0);
     }
 
+    /// Request to add delegation to the validator's staking pool, processed at the end of the epoch.
     public(friend) fun request_add_delegation(
         self: &mut Validator,
         delegated_stake: Balance<SUI>,
         locking_period: Option<EpochTimeLock>,
+        delegator: address,
         ctx: &mut TxContext,
     ) {
         let delegate_amount = balance::value(&delegated_stake);
         assert!(delegate_amount > 0, 0);
-        staking_pool::request_add_delegation(&mut self.delegation_staking_pool, delegated_stake, locking_period, ctx);
-
-        increase_next_epoch_delegation(self, delegate_amount);
+        staking_pool::request_add_delegation(&mut self.delegation_staking_pool, delegated_stake, locking_period, delegator, ctx);
+        self.metadata.next_epoch_delegation = self.metadata.next_epoch_delegation + delegate_amount;
     }
 
-    public(friend) fun increase_next_epoch_delegation(self: &mut Validator, amount: u64) {
-        self.metadata.next_epoch_delegation = self.metadata.next_epoch_delegation + amount;
-    }
-
+    /// Request to withdraw delegation from the validator's staking pool, processed at the end of the epoch.
     public(friend) fun request_withdraw_delegation(
         self: &mut Validator,
         delegation: &mut Delegation,
@@ -208,25 +215,41 @@ module sui::validator {
         withdraw_pool_token_amount: u64,
         ctx: &mut TxContext,
     ) {
-        let withdraw_sui_amount = staking_pool::withdraw_stake(
+        let withdraw_sui_amount = staking_pool::request_withdraw_delegation(
                 &mut self.delegation_staking_pool, delegation, staked_sui, withdraw_pool_token_amount, ctx);
         decrease_next_epoch_delegation(self, withdraw_sui_amount);
     }
 
+    /// Decrement the delegation amount for next epoch. Also called by `validator_set` when handling delegation switches.
     public(friend) fun decrease_next_epoch_delegation(self: &mut Validator, amount: u64) {
         self.metadata.next_epoch_delegation = self.metadata.next_epoch_delegation - amount;
     }
 
+    /// Request to set new gas price for the next epoch.
     public(friend) fun request_set_gas_price(self: &mut Validator, new_price: u64) {
         self.metadata.next_epoch_gas_price = new_price;
     }
 
-    public(friend) fun distribute_rewards_and_new_delegations(self: &mut Validator, reward: Balance<SUI>, ctx: &mut TxContext) {
+    public(friend) fun request_set_commission_rate(self: &mut Validator, new_commission_rate: u64) {
+        self.metadata.next_epoch_commission_rate = new_commission_rate;
+    }
+
+    /// Deposit delegations rewards into the validator's staking pool, called at the end of the epoch.
+    public(friend) fun deposit_delegation_rewards(self: &mut Validator, reward: Balance<SUI>) {
         self.metadata.next_epoch_delegation = self.metadata.next_epoch_delegation + balance::value(&reward);
-        staking_pool::advance_epoch(&mut self.delegation_staking_pool, reward, ctx);
+        staking_pool::deposit_rewards(&mut self.delegation_staking_pool, reward);
+    }
+
+    /// Process pending delegations and withdraws, called at the end of the epoch.
+    public(friend) fun process_pending_delegations_and_withdraws(self: &mut Validator, ctx: &mut TxContext) {
+        staking_pool::process_pending_delegations(&mut self.delegation_staking_pool, ctx);
+        let reward_withdraw_amount = staking_pool::process_pending_delegation_withdraws(
+            &mut self.delegation_staking_pool, ctx);
+        self.metadata.next_epoch_delegation = self.metadata.next_epoch_delegation - reward_withdraw_amount;
         assert!(delegate_amount(self) == self.metadata.next_epoch_delegation, 0);
     }
 
+    /// Called by `validator_set` for handling delegation switches.
     public(friend) fun get_staking_pool_mut_ref(self: &mut Validator) : &mut StakingPool {
         &mut self.delegation_staking_pool
     }
@@ -259,6 +282,10 @@ module sui::validator {
         self.gas_price
     }
 
+    public fun commission_rate(self: &Validator): u64 {
+        self.commission_rate
+    }
+
     public fun is_duplicate(self: &Validator, other: &Validator): bool {
          self.metadata.sui_address == other.metadata.sui_address
             || self.metadata.name == other.metadata.name
@@ -278,6 +305,7 @@ module sui::validator {
         stake: Balance<SUI>,
         coin_locked_until_epoch: Option<EpochTimeLock>,
         gas_price: u64,
+        commission_rate: u64,
         ctx: &mut TxContext
     ): Validator {
         assert!(
@@ -300,12 +328,14 @@ module sui::validator {
                 next_epoch_stake: stake_amount,
                 next_epoch_delegation: 0,
                 next_epoch_gas_price: gas_price,
+                next_epoch_commission_rate: commission_rate,
             },
             stake_amount,
             pending_stake: 0,
             pending_withdraw: 0,
             gas_price,
             delegation_staking_pool: staking_pool::new(sui_address, tx_context::epoch(ctx) + 1),
+            commission_rate,
         }
     }
 }

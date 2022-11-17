@@ -130,8 +130,6 @@ impl PrimaryToWorker for PrimaryReceiverHandler {
         let message = request.body();
 
         let mut missing = HashSet::new();
-        let mut available = HashSet::new();
-
         for digest in message.digests.iter() {
             // Check if we already have the batch.
             match self.store.read(*digest).await {
@@ -140,7 +138,6 @@ impl PrimaryToWorker for PrimaryReceiverHandler {
                     debug!("Requesting sync for batch {digest}");
                 }
                 Ok(Some(_)) => {
-                    available.insert(*digest);
                     trace!("Digest {digest} already in store, nothing to sync");
                 }
                 Err(e) => {
@@ -212,7 +209,7 @@ impl PrimaryToWorker for PrimaryReceiverHandler {
                 let names: Vec<_> = self
                     .worker_cache
                     .load()
-                    .others_workers(&self.name, &self.id)
+                    .others_workers_by_id(&self.name, &self.id)
                     .into_iter()
                     .map(|(_, info)| info.name)
                     .collect();
@@ -245,7 +242,11 @@ impl PrimaryToWorker for PrimaryReceiverHandler {
                         if let Some(batch) = response.into_body().batch {
                             let digest = batch.digest();
                             if missing.remove(&digest) {
-                                self.store.async_write(digest, batch).await;
+                                self.store.sync_write(digest, batch).await.map_err(|e| {
+                                    anemo::rpc::Status::internal(format!(
+                                        "failed to write to batch store: {e:?}"
+                                    ))
+                                })?;
                             }
                         }
                         if missing.is_empty() {

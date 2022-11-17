@@ -3,17 +3,11 @@
 
 import { GrowthBook } from '@growthbook/growthbook';
 
-import { CURRENT_ENV } from './envUtil';
-
 const GROWTHBOOK_API_KEY = import.meta.env.PROD
     ? 'key_prod_ac59fe325855eb5f'
     : 'key_dev_dc2872e15e0c5f95';
 
-export const growthbook = new GrowthBook({
-    attributes: {
-        network: CURRENT_ENV,
-    },
-});
+export const growthbook = new GrowthBook();
 
 export async function loadFeatures() {
     try {
@@ -31,4 +25,8 @@ export async function loadFeatures() {
     } catch (e) {
         console.warn('Failed to fetch feature definitions from Growthbook', e);
     }
+}
+
+export enum GROWTHBOOK_FEATURES {
+    USE_TEST_NET_ENDPOINT = 'testnet-selection',
 }

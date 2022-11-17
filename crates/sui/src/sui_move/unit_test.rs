@@ -27,10 +27,15 @@ impl Test {
         let rerooted_path = base::reroot_path(path)?;
         // pre build for Sui-specific verifications
         let dump_bytecode_as_base64 = false;
+        let generate_struct_layouts: bool = false;
         build::Build::execute_internal(
             &rerooted_path,
-            build_config.clone(),
+            BuildConfig {
+                test_mode: true, // make sure to verify tests
+                ..build_config.clone()
+            },
             dump_bytecode_as_base64,
+            generate_struct_layouts,
         )?;
         sui_framework::run_move_unit_tests(
             &rerooted_path,

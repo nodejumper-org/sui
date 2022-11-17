@@ -5,134 +5,26 @@ use consensus::{
     bullshark::Bullshark,
     dag::Dag,
     metrics::{ChannelMetrics, ConsensusMetrics},
-    Consensus, ConsensusOutput,
+    Consensus,
 };
 
 use crypto::{KeyPair, NetworkKeyPair, PublicKey};
 use executor::{get_restored_consensus_output, ExecutionState, Executor, SubscriberResult};
 use fastcrypto::traits::{KeyPair as _, VerifyingKey};
-use itertools::Itertools;
 use network::P2pNetwork;
-use primary::{NetworkModel, PayloadToken, Primary, PrimaryChannelMetrics};
+use primary::{NetworkModel, Primary, PrimaryChannelMetrics};
 use prometheus::{IntGauge, Registry};
 use std::sync::Arc;
-use storage::{CertificateStore, ProposerKey, ProposerStore};
-use store::{
-    reopen,
-    rocks::{open_cf, DBMap},
-    Store,
-};
+use storage::NodeStorage;
 use tokio::sync::oneshot;
 use tokio::{sync::watch, task::JoinHandle};
 use tracing::{debug, info};
-use types::{
-    metered_channel, Batch, BatchDigest, Certificate, CertificateDigest, ConsensusStore, Header,
-    HeaderDigest, ReconfigureNotification, Round, RoundVoteDigestPair, SequenceNumber,
-};
+use types::{metered_channel, Certificate, ReconfigureNotification, Round};
 use worker::{metrics::initialise_metrics, Worker};
 
 pub mod execution_state;
 pub mod metrics;
 pub mod restarter;
-
-/// All the data stores of the node.
-pub struct NodeStorage {
-    pub proposer_store: ProposerStore,
-    pub vote_digest_store: Store<PublicKey, RoundVoteDigestPair>,
-    pub header_store: Store<HeaderDigest, Header>,
-    pub certificate_store: CertificateStore,
-    pub payload_store: Store<(BatchDigest, WorkerId), PayloadToken>,
-    pub batch_store: Store<BatchDigest, Batch>,
-    pub consensus_store: Arc<ConsensusStore>,
-    pub temp_batch_store: Store<(CertificateDigest, BatchDigest), Batch>,
-}
-
-impl NodeStorage {
-    /// The datastore column family names.
-    const LAST_PROPOSED_CF: &'static str = "last_proposed";
-    const VOTES_CF: &'static str = "votes";
-    const HEADERS_CF: &'static str = "headers";
-    const CERTIFICATES_CF: &'static str = "certificates";
-    const CERTIFICATE_ID_BY_ROUND_CF: &'static str = "certificate_id_by_round";
-    const CERTIFICATE_ID_BY_ORIGIN_CF: &'static str = "certificate_id_by_origin";
-    const PAYLOAD_CF: &'static str = "payload";
-    const BATCHES_CF: &'static str = "batches";
-    const LAST_COMMITTED_CF: &'static str = "last_committed";
-    const SEQUENCE_CF: &'static str = "sequence";
-    const TEMP_BATCH_CF: &'static str = "temp_batches";
-
-    /// Open or reopen all the storage of the node.
-    pub fn reopen<Path: AsRef<std::path::Path>>(store_path: Path) -> Self {
-        let rocksdb = open_cf(
-            store_path,
-            None,
-            &[
-                Self::LAST_PROPOSED_CF,
-                Self::VOTES_CF,
-                Self::HEADERS_CF,
-                Self::CERTIFICATES_CF,
-                Self::CERTIFICATE_ID_BY_ROUND_CF,
-                Self::CERTIFICATE_ID_BY_ORIGIN_CF,
-                Self::PAYLOAD_CF,
-                Self::BATCHES_CF,
-                Self::LAST_COMMITTED_CF,
-                Self::SEQUENCE_CF,
-                Self::TEMP_BATCH_CF,
-            ],
-        )
-        .expect("Cannot open database");
-
-        let (
-            last_proposed_map,
-            votes_map,
-            header_map,
-            certificate_map,
-            certificate_id_by_round_map,
-            certificate_id_by_origin_map,
-            payload_map,
-            batch_map,
-            last_committed_map,
-            sequence_map,
-            temp_batch_map,
-        ) = reopen!(&rocksdb,
-            Self::LAST_PROPOSED_CF;<ProposerKey, Header>,
-            Self::VOTES_CF;<PublicKey, RoundVoteDigestPair>,
-            Self::HEADERS_CF;<HeaderDigest, Header>,
-            Self::CERTIFICATES_CF;<CertificateDigest, Certificate>,
-            Self::CERTIFICATE_ID_BY_ROUND_CF;<(Round, PublicKey), CertificateDigest>,
-            Self::CERTIFICATE_ID_BY_ORIGIN_CF;<(PublicKey, Round), CertificateDigest>,
-            Self::PAYLOAD_CF;<(BatchDigest, WorkerId), PayloadToken>,
-            Self::BATCHES_CF;<BatchDigest, Batch>,
-            Self::LAST_COMMITTED_CF;<PublicKey, Round>,
-            Self::SEQUENCE_CF;<SequenceNumber, CertificateDigest>,
-            Self::TEMP_BATCH_CF;<(CertificateDigest, BatchDigest), Batch>
-        );
-
-        let proposer_store = ProposerStore::new(last_proposed_map);
-        let vote_digest_store = Store::new(votes_map);
-        let header_store = Store::new(header_map);
-        let certificate_store = CertificateStore::new(
-            certificate_map,
-            certificate_id_by_round_map,
-            certificate_id_by_origin_map,
-        );
-        let payload_store = Store::new(payload_map);
-        let batch_store = Store::new(batch_map);
-        let consensus_store = Arc::new(ConsensusStore::new(last_committed_map, sequence_map));
-        let temp_batch_store = Store::new(temp_batch_map);
-
-        Self {
-            proposer_store,
-            vote_digest_store,
-            header_store,
-            certificate_store,
-            payload_store,
-            batch_store,
-            consensus_store,
-            temp_batch_store,
-        }
-    }
-}
 
 /// High level functions to spawn the primary and the workers.
 pub struct Node;
@@ -250,7 +142,6 @@ impl Node {
             store.proposer_store.clone(),
             store.payload_store.clone(),
             store.vote_digest_store.clone(),
-            store.consensus_store.clone(),
             tx_new_certificates,
             rx_committed_certificates,
             dag,
@@ -293,7 +184,7 @@ impl Node {
         execution_state: State,
         tx_reconfigure: &watch::Sender<ReconfigureNotification>,
         rx_new_certificates: metered_channel::Receiver<Certificate>,
-        tx_committed_certificates: metered_channel::Sender<Certificate>,
+        tx_committed_certificates: metered_channel::Sender<(Round, Vec<Certificate>)>,
         registry: &Registry,
     ) -> SubscriberResult<Vec<JoinHandle<()>>>
     where
@@ -312,21 +203,18 @@ impl Node {
             store.certificate_store.clone(),
             &execution_state,
         )
-        .await?
-        .into_iter()
-        .sorted_by(|a, b| a.consensus_index.cmp(&b.consensus_index))
-        .collect::<Vec<ConsensusOutput>>();
+        .await?;
 
-        let len_restored = restored_consensus_output.len() as u64;
-        if len_restored > 0 {
+        let num_leaders = restored_consensus_output.len() as u64;
+        let num_certificates: usize = restored_consensus_output.iter().map(|x| x.len()).sum();
+        if num_leaders > 0 {
             info!(
-                "Consensus output on its way to the executor was restored for {} certificates",
-                len_restored
+                "Consensus output on its way to the executor was restored for {num_leaders} leaders and {num_certificates} certificates",
             );
         }
         consensus_metrics
             .recovered_consensus_output
-            .inc_by(len_restored);
+            .inc_by(num_certificates as u64);
 
         // Spawn the consensus core who only sequences transactions.
         let ordering_engine = Bullshark::new(

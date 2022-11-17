@@ -1,7 +1,6 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 use anyhow::{anyhow, Error};
-use digest::Digest;
 use fastcrypto::bls12381::min_sig::{
     BLS12381AggregateSignature, BLS12381KeyPair, BLS12381PrivateKey, BLS12381PublicKey,
     BLS12381Signature,
@@ -16,13 +15,13 @@ pub use fastcrypto::traits::{
     VerifyingKey,
 };
 use fastcrypto::Verifier;
-use rand::rngs::OsRng;
+use rand::rngs::{OsRng, StdRng};
+use rand::SeedableRng;
 use roaring::RoaringBitmap;
 use schemars::JsonSchema;
 use serde::ser::Serializer;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_with::{serde_as, Bytes};
-use sha3::Sha3_256;
 use signature::Signer;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
@@ -34,7 +33,8 @@ use crate::committee::{Committee, EpochId, StakeUnit};
 use crate::error::{SuiError, SuiResult};
 use crate::intent::{Intent, IntentMessage};
 use crate::sui_serde::{AggrAuthSignature, Readable, SuiBitmap};
-use fastcrypto::encoding::{Base64, Encoding};
+use fastcrypto::encoding::{Base64, Encoding, Hex};
+use fastcrypto::hash::{HashFunction, Sha3_256};
 use std::fmt::Debug;
 
 pub use enum_dispatch::enum_dispatch;
@@ -333,7 +333,7 @@ pub struct AuthorityPublicKeyBytes(
 
 impl AuthorityPublicKeyBytes {
     fn fmt_impl(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
-        let s = hex::encode(self.0);
+        let s = Hex::encode(self.0);
         write!(f, "k#{}", s)?;
         Ok(())
     }
@@ -352,7 +352,7 @@ pub struct ConciseAuthorityPublicKeyBytes<'a>(&'a AuthorityPublicKeyBytes);
 
 impl std::fmt::Debug for ConciseAuthorityPublicKeyBytes<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
-        let s = hex::encode(&self.0 .0[0..4]);
+        let s = Hex::encode(&self.0 .0[0..4]);
         write!(f, "k#{}..", s)
     }
 }
@@ -419,9 +419,8 @@ impl FromStr for AuthorityPublicKeyBytes {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.strip_prefix("0x").unwrap_or(s);
-        let value = hex::decode(s)?;
-        Self::from_bytes(&value[..]).map_err(|_| anyhow::anyhow!("byte deserialization failed"))
+        let value = Hex::decode(s).map_err(|e| anyhow!(e))?;
+        Self::from_bytes(&value[..]).map_err(|e| anyhow!(e))
     }
 }
 
@@ -430,11 +429,16 @@ impl FromStr for AuthorityPublicKeyBytes {
 //
 
 pub trait SuiAuthoritySignature {
-    fn new<T>(value: &T, secret: &dyn Signer<Self>) -> Self
+    fn new<T>(value: &T, epoch_id: EpochId, secret: &dyn Signer<Self>) -> Self
     where
         T: Signable<Vec<u8>>;
 
-    fn verify<T>(&self, value: &T, author: AuthorityPublicKeyBytes) -> Result<(), SuiError>
+    fn verify<T>(
+        &self,
+        value: &T,
+        epoch_id: EpochId,
+        author: AuthorityPublicKeyBytes,
+    ) -> Result<(), SuiError>
     where
         T: Signable<Vec<u8>>;
 
@@ -453,16 +457,22 @@ pub trait SuiAuthoritySignature {
 }
 
 impl SuiAuthoritySignature for AuthoritySignature {
-    fn new<T>(value: &T, secret: &dyn Signer<Self>) -> Self
+    fn new<T>(value: &T, epoch_id: EpochId, secret: &dyn Signer<Self>) -> Self
     where
         T: Signable<Vec<u8>>,
     {
         let mut message = Vec::new();
         value.write(&mut message);
+        epoch_id.write(&mut message);
         secret.sign(&message)
     }
 
-    fn verify<T>(&self, value: &T, author: AuthorityPublicKeyBytes) -> Result<(), SuiError>
+    fn verify<T>(
+        &self,
+        value: &T,
+        epoch_id: EpochId,
+        author: AuthorityPublicKeyBytes,
+    ) -> Result<(), SuiError>
     where
         T: Signable<Vec<u8>>,
     {
@@ -475,6 +485,7 @@ impl SuiAuthoritySignature for AuthoritySignature {
         // serialize the message (see BCS serialization for determinism)
         let mut message = Vec::new();
         value.write(&mut message);
+        epoch_id.write(&mut message);
 
         // perform cryptographic signature check
         public_key
@@ -576,7 +587,7 @@ where
     R: rand::CryptoRng + rand::RngCore,
     <KP as KeypairTraits>::PubKey: SuiPublicKey,
 {
-    let kp = KP::generate(csprng);
+    let kp = KP::generate(&mut StdRng::from_rng(csprng).unwrap());
     (kp.public().into(), kp)
 }
 
@@ -1025,13 +1036,14 @@ pub fn add_to_verification_obligation_and_verify<S, T>(
     sig: &S,
     data: &T,
     committee: &Committee,
+    epoch_id: EpochId,
 ) -> SuiResult
 where
     S: AuthoritySignInfoTrait,
     T: Signable<Vec<u8>>,
 {
     let mut obligation = VerificationObligation::default();
-    let idx = obligation.add_message(data);
+    let idx = obligation.add_message(data, epoch_id);
     sig.add_to_verification_obligation(committee, &mut obligation, idx)?;
     obligation.verify_all()?;
     Ok(())
@@ -1045,7 +1057,7 @@ pub struct AuthoritySignInfo {
 }
 impl AuthoritySignInfoTrait for AuthoritySignInfo {
     fn verify<T: Signable<Vec<u8>>>(&self, data: &T, committee: &Committee) -> SuiResult<()> {
-        add_to_verification_obligation_and_verify(self, data, committee)
+        add_to_verification_obligation_and_verify(self, data, committee, self.epoch)
     }
 
     fn add_to_verification_obligation(
@@ -1087,7 +1099,7 @@ impl AuthoritySignInfo {
         Self {
             epoch,
             authority: name,
-            signature: AuthoritySignature::new(value, secret),
+            signature: AuthoritySignature::new(value, epoch, secret),
         }
     }
 }
@@ -1155,7 +1167,7 @@ impl<const STRONG_THRESHOLD: bool> AuthoritySignInfoTrait
     for AuthorityQuorumSignInfo<STRONG_THRESHOLD>
 {
     fn verify<T: Signable<Vec<u8>>>(&self, data: &T, committee: &Committee) -> SuiResult<()> {
-        add_to_verification_obligation_and_verify(self, data, committee)
+        add_to_verification_obligation_and_verify(self, data, committee, self.epoch)
     }
 
     fn add_to_verification_obligation(
@@ -1342,11 +1354,6 @@ mod bcs_signable {
     impl BcsSignable for crate::committee::CommitteeWithNetAddresses {}
     impl BcsSignable for crate::messages_checkpoint::CheckpointSummary {}
     impl BcsSignable for crate::messages_checkpoint::CheckpointContents {}
-    impl BcsSignable for crate::messages_checkpoint::CheckpointProposalContents {}
-    impl BcsSignable for crate::messages_checkpoint::CheckpointProposalSummary {}
-    impl BcsSignable for crate::messages_checkpoint::CheckpointFragmentMessageHeader {}
-    impl BcsSignable for crate::messages_checkpoint::CheckpointFragmentMessageChunk {}
-    impl BcsSignable for crate::messages_checkpoint::CheckpointFragmentMessage {}
 
     impl BcsSignable for crate::messages::CommitteeInfoResponse {}
     impl BcsSignable for crate::messages::TransactionEffects {}
@@ -1368,6 +1375,15 @@ where
         let name = serde_name::trace_name::<Self>().expect("Self must be a struct or an enum");
         // Note: This assumes that names never contain the separator `::`.
         write!(writer, "{}::", name).expect("Hasher should not fail");
+        bcs::serialize_into(writer, &self).expect("Message serialization should not fail");
+    }
+}
+
+impl<W> Signable<W> for EpochId
+where
+    W: std::io::Write,
+{
+    fn write(&self, writer: &mut W) {
         bcs::serialize_into(writer, &self).expect("Message serialization should not fail");
     }
 }
@@ -1442,12 +1458,13 @@ impl VerificationObligation {
 
     /// Add a new message to the list of messages to be verified.
     /// Returns the index of the message.
-    pub fn add_message<T>(&mut self, message_value: &T) -> usize
+    pub fn add_message<T>(&mut self, message_value: &T, epoch: EpochId) -> usize
     where
         T: Signable<Vec<u8>>,
     {
         let mut message = Vec::new();
         message_value.write(&mut message);
+        epoch.write(&mut message);
 
         self.signatures.push(AggregateAuthoritySignature::default());
         self.public_keys.push(Vec::new());
@@ -1521,7 +1538,7 @@ pub mod bcs_signable_test {
     {
         let mut obligation = VerificationObligation::default();
         // Add the obligation of the authority signature verifications.
-        let idx = obligation.add_message(value);
+        let idx = obligation.add_message(value, 0);
         (obligation, idx)
     }
 }

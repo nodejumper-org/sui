@@ -4,7 +4,8 @@
 use crate::ValidatorInfo;
 use anyhow::{bail, Context, Result};
 use camino::Utf8Path;
-use fastcrypto::encoding::{Base64, Encoding};
+use fastcrypto::encoding::{Base64, Encoding, Hex};
+use fastcrypto::hash::{HashFunction, Sha3_256};
 use move_binary_format::CompiledModule;
 use move_core_types::ident_str;
 use move_core_types::language_storage::ModuleId;
@@ -31,7 +32,7 @@ use sui_types::temporary_store::{InnerTemporaryStore, TemporaryStore};
 use sui_types::MOVE_STDLIB_ADDRESS;
 use sui_types::SUI_FRAMEWORK_ADDRESS;
 use sui_types::{
-    base_types::{encode_bytes_hex, TxContext},
+    base_types::TxContext,
     committee::{Committee, EpochId},
     error::SuiResult,
     object::Object,
@@ -56,6 +57,10 @@ impl Genesis {
 
     pub fn validator_set(&self) -> &[ValidatorInfo] {
         &self.validator_set
+    }
+
+    pub fn into_validator_set(self) -> Vec<ValidatorInfo> {
+        self.validator_set
     }
 
     pub fn committee(&self) -> SuiResult<Committee> {
@@ -168,10 +173,9 @@ impl Genesis {
     }
 
     pub fn sha3(&self) -> [u8; 32] {
-        use digest::Digest;
         use std::io::Write;
 
-        let mut digest = sha3::Sha3_256::default();
+        let mut digest = Sha3_256::default();
         digest.write_all(&self.to_bytes()).unwrap();
         let hash = digest.finalize();
         hash.into()
@@ -401,7 +405,7 @@ impl Builder {
 
         for (_id, object) in self.objects {
             let object_bytes = serde_yaml::to_vec(&object)?;
-            let hex_digest = encode_bytes_hex(object.digest());
+            let hex_digest = Hex::encode(object.digest());
             fs::write(object_dir.join(hex_digest), object_bytes)?;
         }
 
@@ -411,7 +415,7 @@ impl Builder {
 
         for (_pubkey, validator) in self.validators {
             let validator_info_bytes = serde_yaml::to_vec(&validator)?;
-            let hex_name = encode_bytes_hex(validator.info.protocol_key());
+            let hex_name = Hex::encode(validator.info.protocol_key());
             fs::write(committee_dir.join(hex_name), validator_info_bytes)?;
         }
 
@@ -542,6 +546,7 @@ pub fn generate_genesis_system_object(
     let mut names = Vec::new();
     let mut stakes = Vec::new();
     let mut gas_prices = Vec::new();
+    let mut commission_rates = Vec::new();
 
     for GenesisValidatorInfo {
         info: validator,
@@ -556,6 +561,7 @@ pub fn generate_genesis_system_object(
         names.push(validator.name().to_owned().into_bytes());
         stakes.push(validator.stake());
         gas_prices.push(validator.gas_price());
+        commission_rates.push(validator.commission_rate());
     }
 
     adapter::execute(
@@ -573,6 +579,7 @@ pub fn generate_genesis_system_object(
             CallArg::Pure(bcs::to_bytes(&network_addresses).unwrap()),
             CallArg::Pure(bcs::to_bytes(&stakes).unwrap()),
             CallArg::Pure(bcs::to_bytes(&gas_prices).unwrap()),
+            CallArg::Pure(bcs::to_bytes(&commission_rates).unwrap()),
         ],
         SuiGasStatus::new_unmetered().create_move_gas_status(),
         genesis_ctx,
@@ -632,6 +639,7 @@ mod test {
             stake: 1,
             delegation: 0,
             gas_price: 1,
+            commission_rate: 0,
             network_address: utils::new_network_address(),
             narwhal_primary_address: utils::new_network_address(),
             narwhal_worker_address: utils::new_network_address(),

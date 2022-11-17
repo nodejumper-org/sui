@@ -1,10 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{
-    authority_store::{InternalSequenceNumber, ObjectKey, PendingDigest},
-    *,
-};
+use super::{authority_store::ObjectKey, *};
 use narwhal_executor::ExecutionIndices;
 use rocksdb::Options;
 use serde::{Deserialize, Serialize};
@@ -12,10 +9,11 @@ use std::path::Path;
 use sui_storage::default_db_options;
 use sui_types::base_types::{ExecutionDigests, SequenceNumber};
 use sui_types::batch::{SignedBatch, TxSequenceNumber};
-use sui_types::messages::{TrustedCertificate, TrustedTransactionEnvelope};
+use sui_types::messages::TrustedCertificate;
 use typed_store::rocks::{DBMap, DBOptions};
 use typed_store::traits::TypedStoreDebug;
 
+use sui_types::message_envelope::TrustedEnvelope;
 use typed_store_derive::DBMapUtils;
 
 /// AuthorityEpochTables contains tables that contain data that is only valid within an epoch.
@@ -23,16 +21,7 @@ use typed_store_derive::DBMapUtils;
 pub struct AuthorityEpochTables<S> {
     /// This is map between the transaction digest and transactions found in the `transaction_lock`.
     #[default_options_override_fn = "transactions_table_default_config"]
-    pub(crate) transactions: DBMap<TransactionDigest, TrustedTransactionEnvelope<S>>,
-
-    /// The pending execution table holds a sequence of transactions that are present
-    /// in the certificates table, but may not have yet been executed, and should be executed.
-    /// The source of these certificates might be (1) the checkpoint proposal process (2) the
-    /// gossip processes (3) the shared object post-consensus task. An active authority process
-    /// reads this table and executes the certificates. The order is a hint as to their
-    /// causal dependencies. Note that there is no guarantee digests are unique. Once executed, and
-    /// effects are written the entry should be deleted.
-    pub(crate) pending_execution: DBMap<InternalSequenceNumber, PendingDigest>,
+    pub(crate) transactions: DBMap<TransactionDigest, TrustedEnvelope<SenderSignedData, S>>,
 
     /// Hold the lock for shared objects. These locks are written by a single task: upon receiving a valid
     /// certified transaction from consensus, the authority assigns a lock to each shared objects of the
@@ -40,6 +29,17 @@ pub struct AuthorityEpochTables<S> {
     /// TODO: These two maps should be merged into a single one (no reason to have two).
     pub(crate) assigned_object_versions: DBMap<(TransactionDigest, ObjectID), SequenceNumber>,
     pub(crate) next_object_versions: DBMap<ObjectID, SequenceNumber>,
+
+    /// Certificates that have been received from clients or received from consensus, but not yet
+    /// executed. Entries are cleared after execution.
+    /// This table is critical for crash recovery, because usually the consensus output progress
+    /// is updated after a certificate is committed into this table.
+    ///
+    /// If theory, this table may be superseded by storing consensus and checkpoint execution
+    /// progress. But it is more complex, because it would be necessary to track inflight
+    /// executions not ordered by indices. For now, tracking inflight certificates as a map
+    /// seems easier.
+    pub(crate) pending_certificates: DBMap<TransactionDigest, TrustedCertificate>,
 
     /// Track which transactions have been processed in handle_consensus_transaction. We must be
     /// sure to advance next_object_versions exactly once for each transaction we receive from
@@ -51,11 +51,24 @@ pub struct AuthorityEpochTables<S> {
     /// epoch change.
     pub(crate) consensus_message_processed: DBMap<TransactionDigest, bool>,
 
+    /// This is an inverse index for consensus_message_processed - it allows to select
+    /// all transactions at the specific consensus range
+    ///
+    /// The consensus position for the transaction is defined as first position at which valid
+    /// certificate for this transaction is seen in consensus
+    pub(crate) consensus_message_order: DBMap<ExecutionIndices, TransactionDigest>,
+
     /// The following table is used to store a single value (the corresponding key is a constant). The value
     /// represents the index of the latest consensus message this authority processed. This field is written
     /// by a single process acting as consensus (light) client. It is used to ensure the authority processes
     /// every message output by consensus (and in the right order).
     pub(crate) last_consensus_index: DBMap<u64, ExecutionIndicesWithHash>,
+
+    /// This table lists all checkpoint boundaries in the consensus sequence
+    ///
+    /// The key in this table is incremental index and value is corresponding narwhal
+    /// consensus output index
+    pub(crate) checkpoint_boundary: DBMap<u64, u64>,
 }
 
 impl<S> AuthorityEpochTables<S>
@@ -138,6 +151,8 @@ pub struct AuthorityPerpetualTables<S> {
 
     /// A sequence of batches indexing into the sequence of executed transactions.
     pub batches: DBMap<TxSequenceNumber, SignedBatch>,
+
+    pub reconfig_state: DBMap<u64, ReconfigState>,
 }
 
 impl<S> AuthorityPerpetualTables<S>

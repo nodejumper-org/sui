@@ -30,6 +30,7 @@
 */
 
 use arc_swap::ArcSwap;
+use prometheus::Registry;
 use std::{collections::HashMap, ops::Deref, sync::Arc, time::Duration};
 use sui_metrics::spawn_monitored_task;
 use sui_types::{base_types::AuthorityName, error::SuiResult};
@@ -55,15 +56,11 @@ use tokio::time::Instant;
 pub mod gossip;
 use gossip::{gossip_process, GossipMetrics};
 
-pub mod checkpoint_driver;
-use crate::authority_active::checkpoint_driver::CheckpointMetrics;
 use crate::authority_client::NetworkAuthorityClientMetrics;
-use crate::epoch::reconfiguration::Reconfigurable;
-use checkpoint_driver::{checkpoint_process, get_latest_checkpoint_from_all, sync_to_checkpoint};
 
 pub mod execution_driver;
 
-use self::{checkpoint_driver::CheckpointProcessControl, execution_driver::execution_process};
+use self::execution_driver::{execution_process, ExecutionDriverMetrics};
 
 // TODO: Make these into a proper config
 const MAX_RETRIES_RECORDED: u32 = 10;
@@ -135,13 +132,15 @@ pub struct ActiveAuthority<A> {
     // This is only meaningful if A is of type NetworkAuthorityClient,
     // and stored here for reconfiguration purposes.
     pub network_metrics: Arc<NetworkAuthorityClientMetrics>,
+
+    pub execution_driver_metrics: ExecutionDriverMetrics,
 }
 
 impl<A> ActiveAuthority<A> {
     pub fn new(
         authority: Arc<AuthorityState>,
         net: AuthorityAggregator<A>,
-        gossip_metrics: GossipMetrics,
+        prometheus_registry: &Registry,
         network_metrics: Arc<NetworkAuthorityClientMetrics>,
     ) -> SuiResult<Self> {
         let committee = authority.clone_committee();
@@ -159,8 +158,9 @@ impl<A> ActiveAuthority<A> {
             node_sync_handle: OnceCell::new(),
             node_sync_process: Default::default(),
             net: ArcSwap::from(net),
-            gossip_metrics,
+            gossip_metrics: GossipMetrics::new(prometheus_registry),
             network_metrics,
+            execution_driver_metrics: ExecutionDriverMetrics::new(prometheus_registry),
         })
     }
 
@@ -175,7 +175,7 @@ impl<A> ActiveAuthority<A> {
         Self::new(
             authority,
             net,
-            GossipMetrics::new_for_tests(),
+            &Registry::new(),
             Arc::new(NetworkAuthorityClientMetrics::new_for_tests()),
         )
     }
@@ -243,6 +243,7 @@ impl<A> Clone for ActiveAuthority<A> {
             health: self.health.clone(),
             gossip_metrics: self.gossip_metrics.clone(),
             network_metrics: self.network_metrics.clone(),
+            execution_driver_metrics: self.execution_driver_metrics.clone(),
         }
     }
 }
@@ -259,38 +260,6 @@ where
                 NodeSyncHandle::new(node_sync_state, self.gossip_metrics.clone())
             })
             .clone()
-    }
-
-    pub async fn sync_to_latest_checkpoint(self: Arc<Self>) -> SuiResult {
-        self.sync_to_latest_checkpoint_with_config(Default::default())
-            .await
-    }
-
-    pub async fn sync_to_latest_checkpoint_with_config(
-        self: Arc<Self>,
-        checkpoint_process_control: CheckpointProcessControl,
-    ) -> SuiResult {
-        let checkpoint_store = self.state.checkpoints.clone();
-
-        // TODO: fullnode should not get proposals
-        // TODO: potentially move get_latest_proposal_and_checkpoint_from_all and
-        // sync_to_checkpoint out of checkpoint_driver
-        let checkpoint_summary = get_latest_checkpoint_from_all(
-            self.agg_aggregator(),
-            checkpoint_process_control.extra_time_after_quorum,
-            checkpoint_process_control.timeout_until_quorum,
-        )
-        .await?;
-
-        let checkpoint_summary = match checkpoint_summary {
-            Some(c) => c,
-            None => {
-                info!(name = ?self.state.name, "no checkpoints found");
-                return Ok(());
-            }
-        };
-
-        sync_to_checkpoint(self, checkpoint_store, checkpoint_summary).await
     }
 
     /// Spawn gossip process
@@ -371,39 +340,13 @@ where
         *lock_guard = Some(NodeSyncProcessHandle(join_handle, cancel_sender));
     }
 
-    /// Spawn pending certificate execution process
-    pub async fn spawn_execute_process(self: Arc<Self>) -> JoinHandle<()> {
-        spawn_monitored_task!(execution_process(self))
-    }
-
     pub async fn cancel_node_sync_process_for_tests(&self) {
         let mut lock_guard = self.node_sync_process.lock().await;
         Self::cancel_node_sync_process_impl(&mut lock_guard).await;
     }
-}
 
-impl<A> ActiveAuthority<A>
-where
-    A: AuthorityAPI + Send + Sync + 'static + Clone + Reconfigurable,
-{
-    pub async fn spawn_checkpoint_process(
-        self: Arc<Self>,
-        metrics: CheckpointMetrics,
-    ) -> JoinHandle<()> {
-        self.spawn_checkpoint_process_with_config(CheckpointProcessControl::default(), metrics)
-            .await
-    }
-
-    pub async fn spawn_checkpoint_process_with_config(
-        self: Arc<Self>,
-        checkpoint_process_control: CheckpointProcessControl,
-        metrics: CheckpointMetrics,
-    ) -> JoinHandle<()> {
-        // Spawn task to take care of checkpointing
-        spawn_monitored_task!(checkpoint_process(
-            self,
-            &checkpoint_process_control,
-            metrics
-        ))
+    /// Spawn pending certificate execution process
+    pub async fn spawn_execute_process(self: Arc<Self>) -> JoinHandle<()> {
+        spawn_monitored_task!(execution_process(self))
     }
 }

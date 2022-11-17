@@ -7,7 +7,6 @@ pub mod authority_aggregator;
 pub mod authority_batch;
 pub mod authority_client;
 pub mod authority_server;
-pub mod checkpoints;
 pub mod consensus_adapter;
 pub mod epoch;
 pub mod event_handler;
@@ -24,9 +23,11 @@ pub mod validator_info;
 
 pub mod test_utils;
 
+pub mod checkpoints;
 mod consensus_handler;
 mod histogram;
 mod node_sync;
 mod query_helpers;
+mod transaction_manager;
 
 pub const SUI_CORE_VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -18,6 +18,7 @@ use move_core_types::{
 use sui_framework_build::compiled_package::BuildConfig;
 use sui_types::{
     crypto::{get_key_pair, AccountKeyPair},
+    error::SuiError,
     event::{Event, EventType},
     messages::ExecutionStatus,
     object::OBJECT_START_VERSION,
@@ -1832,6 +1833,25 @@ fn test_entry_point_string_vec_error() {
     })
 }
 
+#[test]
+#[cfg_attr(msim, ignore)]
+fn test_object_no_id_error() {
+    run_tokio_test_with_big_stack(async move {
+        let mut build_config = BuildConfig::default();
+        build_config.config.test_mode = true;
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // in this package object struct (NotObject) is defined incorrectly and publishing should
+        // fail (it's defined in test-only code hence cannot be checked by transactional testing
+        // framework which goes through "normal" publishing path which excludes tests).
+        path.push("src/unit_tests/data/object_no_id/");
+        let res = sui_framework::build_move_package(&path, build_config);
+
+        matches!(res.err(), Some(SuiError::ExecutionError(err_str)) if
+                 err_str.contains("SuiMoveVerificationError")
+                 && err_str.contains("First field of struct NotObject must be 'id'"));
+    })
+}
+
 pub async fn build_and_try_publish_test_package(
     authority: &AuthorityState,
     sender: &SuiAddress,
@@ -1877,7 +1897,7 @@ async fn build_and_publish_test_package(
     .await
     .signed_effects
     .unwrap()
-    .effects;
+    .into_data();
     assert!(
         matches!(effects.status, ExecutionStatus::Success { .. }),
         "{:?}",

@@ -3,30 +3,24 @@
 
 use crate::authority::authority_store_tables::ExecutionIndicesWithHash;
 use crate::authority::AuthorityState;
-use crate::consensus_adapter::ConsensusListenerMessage;
 use async_trait::async_trait;
 use narwhal_executor::{ExecutionIndices, ExecutionState};
+use narwhal_types::{CommittedSubDag, ConsensusOutput};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex};
 use sui_types::messages::ConsensusTransaction;
-use tokio::sync::mpsc;
 use tracing::{debug, instrument, warn};
 
 pub struct ConsensusHandler {
     state: Arc<AuthorityState>,
-    sender: mpsc::Sender<ConsensusListenerMessage>,
     last_seen: Mutex<ExecutionIndicesWithHash>,
 }
 
 impl ConsensusHandler {
-    pub fn new(state: Arc<AuthorityState>, sender: mpsc::Sender<ConsensusListenerMessage>) -> Self {
+    pub fn new(state: Arc<AuthorityState>) -> Self {
         let last_seen = Mutex::new(Default::default());
-        Self {
-            state,
-            sender,
-            last_seen,
-        }
+        Self { state, last_seen }
     }
 
     fn update_hash(
@@ -40,6 +34,7 @@ impl ConsensusHandler {
         if last_seen_guard.index >= index {
             return None;
         }
+
         let previous_hash = last_seen_guard.hash;
         let mut hasher = DefaultHasher::new();
         previous_hash.hash(&mut hasher);
@@ -65,14 +60,17 @@ impl ExecutionState for ConsensusHandler {
     async fn handle_consensus_transaction(
         &self,
         // TODO [2533]: use this once integrating Narwhal reconfiguration
-        consensus_output: &Arc<narwhal_consensus::ConsensusOutput>,
+        consensus_output: &Arc<ConsensusOutput>,
         consensus_index: ExecutionIndices,
         serialized_transaction: Vec<u8>,
     ) {
-        let consensus_index =
-            Self::update_hash(&self.last_seen, consensus_index, &serialized_transaction);
-        let consensus_index = if let Some(consensus_index) = consensus_index {
-            consensus_index
+        let index = Self::update_hash(
+            &self.last_seen,
+            consensus_index.clone(),
+            &serialized_transaction,
+        );
+        let index = if let Some(index) = index {
+            index
         } else {
             debug!(
                 "Ignore consensus transaction at index {:?} as it appear to be already processed",
@@ -93,7 +91,7 @@ impl ExecutionState for ConsensusHandler {
             };
         let sequenced_transaction = SequencedConsensusTransaction {
             consensus_output: consensus_output.clone(),
-            consensus_index,
+            consensus_index: index,
             transaction,
         };
         let verified_transaction = match self
@@ -107,16 +105,9 @@ impl ExecutionState for ConsensusHandler {
             .handle_consensus_transaction(verified_transaction)
             .await
             .expect("Unrecoverable error in consensus handler");
-        if self
-            .sender
-            .send(ConsensusListenerMessage::Processed(serialized_transaction))
-            .await
-            .is_err()
-        {
-            warn!("Consensus handler outbound channel closed");
-        }
     }
 
+    #[instrument(level = "debug", skip_all, fields(result))]
     async fn load_execution_indices(&self) -> ExecutionIndices {
         let index_with_hash = self
             .state
@@ -130,10 +121,17 @@ impl ExecutionState for ConsensusHandler {
             index_with_hash.clone();
         index_with_hash.index
     }
+
+    #[instrument(level = "trace", skip_all)]
+    async fn notify_commit_boundary(&self, committed_dag: &Arc<CommittedSubDag>) {
+        self.state
+            .handle_commit_boundary(committed_dag)
+            .expect("Unrecoverable error in consensus handler when processing commit boundary")
+    }
 }
 
 pub struct SequencedConsensusTransaction {
-    pub consensus_output: Arc<narwhal_consensus::ConsensusOutput>,
+    pub consensus_output: Arc<narwhal_types::ConsensusOutput>,
     pub consensus_index: ExecutionIndicesWithHash,
     pub transaction: ConsensusTransaction,
 }
@@ -164,16 +162,19 @@ pub fn test_update_hash() {
         next_certificate_index: 0,
         next_batch_index: 0,
         next_transaction_index: 0,
+        last_committed_round: 0,
     };
     let index1 = ExecutionIndices {
         next_certificate_index: 0,
         next_batch_index: 1,
         next_transaction_index: 0,
+        last_committed_round: 0,
     };
     let index2 = ExecutionIndices {
         next_certificate_index: 0,
         next_batch_index: 2,
         next_transaction_index: 0,
+        last_committed_round: 0,
     };
 
     let last_seen = ExecutionIndicesWithHash {

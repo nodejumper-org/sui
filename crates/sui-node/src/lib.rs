@@ -10,13 +10,10 @@ use futures::TryFutureExt;
 use mysten_network::server::ServerBuilder;
 use narwhal_network::metrics::MetricsMakeCallbackHandler;
 use narwhal_network::metrics::{NetworkConnectionMetrics, NetworkMetrics};
-use parking_lot::Mutex;
 use prometheus::Registry;
 use std::option::Option::None;
-use std::time::Instant;
 use std::{sync::Arc, time::Duration};
 use sui_config::NodeConfig;
-use sui_core::authority_active::checkpoint_driver::CheckpointMetrics;
 use sui_core::authority_aggregator::{AuthAggMetrics, AuthorityAggregator};
 use sui_core::authority_server::ValidatorService;
 use sui_core::safe_client::SafeClientMetrics;
@@ -24,18 +21,18 @@ use sui_core::transaction_orchestrator::TransactiondOrchestrator;
 use sui_core::transaction_streamer::TransactionStreamer;
 use sui_core::{
     authority::{AuthorityState, AuthorityStore},
-    authority_active::{gossip::GossipMetrics, ActiveAuthority},
+    authority_active::ActiveAuthority,
     authority_client::{
         make_network_authority_client_sets_from_genesis,
         make_network_authority_client_sets_from_system_state, NetworkAuthorityClient,
     },
-    checkpoints::CheckpointStore,
 };
 use sui_json_rpc::bcs_api::BcsApiImpl;
 use sui_json_rpc::streaming_api::TransactionStreamingApiImpl;
 use sui_json_rpc::transaction_builder_api::FullNodeTransactionBuilderApi;
 use sui_network::api::ValidatorServer;
 use sui_network::default_mysten_network_config;
+use sui_network::discovery;
 use sui_storage::{
     event_store::{EventStoreType, SqlEventStore},
     node_sync_store::NodeSyncStore,
@@ -44,7 +41,7 @@ use sui_storage::{
 use sui_types::messages::{CertifiedTransaction, CertifiedTransactionEffects};
 use tokio::sync::mpsc::channel;
 use tower::ServiceBuilder;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 use typed_store::DBMetrics;
 
 use crate::metrics::GrpcMetrics;
@@ -66,6 +63,10 @@ pub mod metrics;
 
 mod handle;
 pub use handle::SuiNodeHandle;
+use narwhal_types::TransactionsClient;
+use sui_core::checkpoints::{
+    CheckpointMetrics, CheckpointService, LogCheckpointOutput, SubmitCheckpointToConsensus,
+};
 
 pub struct SuiNode {
     grpc_server: tokio::task::JoinHandle<Result<()>>,
@@ -75,13 +76,13 @@ pub struct SuiNode {
     _post_processing_subsystem_handle: Option<tokio::task::JoinHandle<Result<()>>>,
     _gossip_handle: Option<tokio::task::JoinHandle<()>>,
     _execute_driver_handle: tokio::task::JoinHandle<()>,
-    _checkpoint_process_handle: Option<tokio::task::JoinHandle<()>>,
     state: Arc<AuthorityState>,
     active: Arc<ActiveAuthority<NetworkAuthorityClient>>,
     transaction_orchestrator: Option<Arc<TransactiondOrchestrator<NetworkAuthorityClient>>>,
     _prometheus_registry: Registry,
 
     _p2p_network: anemo::Network,
+    _discovery: discovery::Handle,
 
     #[cfg(msim)]
     sim_node: sui_simulator::runtime::NodeHandle,
@@ -111,15 +112,6 @@ impl SuiNode {
             &committee,
             None,
         ));
-
-        let checkpoint_store = Arc::new(Mutex::new(CheckpointStore::open(
-            &config.db_path().join("checkpoints"),
-            None,
-            &committee,
-            config.protocol_public_key(),
-            secret.clone(),
-            config.enable_reconfig,
-        )?));
 
         let index_store = if is_validator {
             None
@@ -152,6 +144,34 @@ impl SuiNode {
             None,
         ));
 
+        let consensus_client = config.consensus_config().map(|config| {
+            let consensus_address = config.address().to_owned();
+            TransactionsClient::new(
+                mysten_network::client::connect_lazy(&consensus_address)
+                    .expect("Failed to connect to consensus"),
+            )
+        });
+
+        let checkpoint_output = if let Some(ref consensus_client) = consensus_client {
+            Box::new(SubmitCheckpointToConsensus {
+                sender: consensus_client.clone(),
+                signer: secret.clone(),
+                authority: config.protocol_public_key(),
+            })
+        } else {
+            // todo - we should refactor code a bit and simply don't start checkpoint builder on full node
+            LogCheckpointOutput::boxed()
+        };
+
+        let checkpoint_service = CheckpointService::spawn(
+            &config.db_path().join("checkpoints"),
+            Box::new(store.clone()),
+            checkpoint_output,
+            LogCheckpointOutput::boxed_certified(),
+            committee.clone(),
+            CheckpointMetrics::new(&prometheus_registry),
+        );
+
         let state = Arc::new(
             AuthorityState::new(
                 config.protocol_public_key(),
@@ -162,10 +182,10 @@ impl SuiNode {
                 index_store.clone(),
                 event_store,
                 transaction_streamer,
-                checkpoint_store,
                 genesis,
                 &prometheus_registry,
                 tx_reconfigure_consensus,
+                checkpoint_service,
             )
             .await,
         );
@@ -200,7 +220,7 @@ impl SuiNode {
         let active_authority = Arc::new(ActiveAuthority::new(
             state.clone(),
             net.clone(),
-            GossipMetrics::new(&prometheus_registry),
+            &prometheus_registry,
             network_metrics.clone(),
         )?);
 
@@ -241,45 +261,24 @@ impl SuiNode {
             };
 
         let gossip_handle = if is_full_node {
-            info!("Starting full node sync to latest checkpoint (this may take a while)");
-            let now = Instant::now();
-            if let Err(err) = active_authority.clone().sync_to_latest_checkpoint().await {
-                error!(
-                    "Full node failed to catch up to latest checkpoint: {:?}",
-                    err
-                );
-            } else {
-                info!(
-                    "Full node caught up to latest checkpoint in {:?}",
-                    now.elapsed()
-                );
-            }
             active_authority.clone().spawn_node_sync_process().await;
             None
-        } else if config.enable_gossip {
-            // TODO: get degree from config file.
-            let degree = 4;
-            Some(active_authority.clone().spawn_gossip_process(degree).await)
         } else {
             None
         };
         let execute_driver_handle = active_authority.clone().spawn_execute_process().await;
-        let checkpoint_process_handle = if config.enable_checkpoint && is_validator {
-            Some(
-                active_authority
-                    .clone()
-                    .spawn_checkpoint_process(CheckpointMetrics::new(&prometheus_registry))
-                    .await,
-            )
-        } else {
-            None
-        };
 
         let registry = prometheus_registry.clone();
-        let validator_service = if config.consensus_config().is_some() {
+        let validator_service = if let Some(consensus_client) = consensus_client {
             Some(
-                ValidatorService::new(config, state.clone(), registry, rx_reconfigure_consensus)
-                    .await?,
+                ValidatorService::new(
+                    Box::new(consensus_client),
+                    config,
+                    state.clone(),
+                    registry,
+                    rx_reconfigure_consensus,
+                )
+                .await?,
             )
         } else {
             None
@@ -306,15 +305,19 @@ impl SuiNode {
             spawn_monitored_task!(server.serve().map_err(Into::into))
         };
 
+        let (discovery, discovery_server) = discovery::Builder::new()
+            .config(config.p2p_config.clone())
+            .build();
+
         let p2p_network = {
+            let routes = anemo::Router::new().add_rpc_service(discovery_server);
+
             let inbound_network_metrics =
                 NetworkMetrics::new("sui", "inbound", &prometheus_registry);
             let outbound_network_metrics =
                 NetworkMetrics::new("sui", "outbound", &prometheus_registry);
             let network_connection_metrics =
                 NetworkConnectionMetrics::new("sui", &prometheus_registry);
-
-            let routes = anemo::Router::new();
 
             let service = ServiceBuilder::new()
                 .layer(TraceLayer::new_for_server_errors())
@@ -347,6 +350,8 @@ impl SuiNode {
             network
         };
 
+        let discovery_handle = discovery.start(p2p_network.clone());
+
         let (json_rpc_service, ws_subscription_service) = build_http_servers(
             state.clone(),
             &transaction_orchestrator.clone(),
@@ -361,7 +366,6 @@ impl SuiNode {
             _ws_subscription_service: ws_subscription_service,
             _gossip_handle: gossip_handle,
             _execute_driver_handle: execute_driver_handle,
-            _checkpoint_process_handle: checkpoint_process_handle,
             _batch_subsystem_handle: batch_subsystem_handle,
             _post_processing_subsystem_handle: post_processing_subsystem_handle,
             state,
@@ -369,6 +373,7 @@ impl SuiNode {
             transaction_orchestrator,
             _prometheus_registry: prometheus_registry,
             _p2p_network: p2p_network,
+            _discovery: discovery_handle,
 
             #[cfg(msim)]
             sim_node: sui_simulator::runtime::NodeHandle::current(),

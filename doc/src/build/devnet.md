@@ -7,7 +7,7 @@ The Sui Devnet network lets you experiment with Sui and provide feedback to help
 The Sui Devnet network currently consists of:
 
 * Four validator nodes operated by Mysten Labs. Clients send transactions and read requests via this endpoint: `https://fullnode.devnet.sui.io:443` using [JSON-RPC](../build/json-rpc.md).
-* A public network [Sui Explorer](https://explorer.devnet.sui.io) for browsing transaction history.
+* A public network [Sui Explorer](https://explorer.sui.io) for browsing transaction history.
 * A [Discord channel](https://discordapp.com/channels/916379725201563759/971488439931392130) for requesting test coins that can be used to pay for gas on the test network. These coins have no financial value and will disappear each time we reset the network.
 
 Watch for update announcements in the [#devnet-updates](https://discord.com/channels/916379725201563759/1004638487078772736) Discord channel.
@@ -40,28 +40,46 @@ If the command doesn't return a path to the command you need to install Sui.
 
 ## Configure Sui client
 
-Now set up your Sui Client CLI to connect to Sui Devnet.
+> **Tip:** If you ran `sui genesis -f` before it created configuration files of Sui client and connecting to localhost `http://0.0.0.0:9000`. You can skip next step and continue on connect to custom RPC endpoint.
 
 To connect the Sui client to Sui Devnet, run the following command:
 ```shell
 $ sui client
 ```
 The Sui CLI prints the following line when the client starts up for the first time:
+
 ```shell
 Config file ["/Users/dir/.sui/sui_config/client.yaml"] doesn't exist, do you want to connect to a Sui RPC server [y/n]?
 ```
 Type `y` and then press `Enter`. You should see the following output:
+
 ```shell
 Sui RPC server Url (Default to Sui Devnet if not specified) :
 ```
-The Sui client prompts you for the RPC server URL; press 'Enter' and it defaults to Devnet. You can also enter a custom URL to connect to a custom RPC endpoint.
+The Sui client prompts you for the RPC server URL. Press Enter to use the default value for Devnet. You can also enter a custom URL to connect to a custom RPC endpoint.
 
-If you previously installed a Sui client with a local network, modify your existing  `client.yaml` to change the RPC endpoint with the following command:
 ```shell
-$ sui client switch --rpc https://fullnode.devnet.sui.io:443
+Select key scheme to generate keypair (0 for ed25519, 1 for secp256k1):
+```
+Type `0` or `1` to select key scheme.
+
+### Connect to custom RPC endpoint
+
+> **Tip:** If you configured with `sui genesis -f` you already have two RPC endpoints (localnet `http://0.0.0.0:9000` and devnet `https://fullnode.devnet.sui.io:443`), check the list `sui client envs`. You can switch to suitable for you.
+
+If you previously installed a Sui client that connected to the Devnet network, you can modify your existing  `client.yaml` to change the RPC endpoint to connect to a custom RPC endpoint:
+
+To add a custom RPC endpoint run the following command with your data:
+```shell
+$ sui client new-env --alias <ALIAS> --rpc <RPC>
+```
+To switch an active network, run the following commands:
+```shell
+$ sui client switch --env <ALIAS>
 ```
 
 > **Tip:** If you run into issues, reset the Sui configuration by removing its directory, by default located at `~/.sui/sui_config`. Then reinstall [Sui binaries](../build/install.md#binaries).
+
 
 ## Validating
 
@@ -96,8 +114,8 @@ Type: 0x2::devnet_nft::DevNetNFT
 
 The preceding command created an object with ID `ED883F6812AF447B9B0CE220DA5EA9E0F58012FE`. Use the `Sui CLI client` to [view objects owned by the address](../build/cli-client.md#view-objects-owned-by-the-address).
 
-Now you can view the created object in the [Sui Explorer](https://explorer.devnet.sui.io) by appending the object ID to:
-https://explorer.devnet.sui.io/objects/
+Now you can view the created object in the [Sui Explorer](https://explorer.sui.io) by appending the object ID to:
+https://explorer.sui.io/objects/
 
 ![Example NFT](../../static/example-nft.png "Example NFT")
 
@@ -117,7 +135,7 @@ Type: 0x2::devnet_nft::DevNetNFT
 ```
 
 You can view details about the object in Sui Explorer:
-https://explorer.devnet.sui.io/objects/EC97467A40A1305FFDEF7019C3045FBC7AA31E29
+https://explorer.sui.io/objects/EC97467A40A1305FFDEF7019C3045FBC7AA31E29
 
 ## Publish a Move module
 
@@ -198,7 +216,7 @@ Mutated Objects:
 Go to the Sui Explorer to observe a newly created object (ID `2E34983D59E9FC5310CFBAA953D2188E6A84FD21`, in this example). You should see a sword object created with `Magic` property of `42` and `Strength` property of `7` and transferred to the new owner.
 
 As above, replace the object ID in the Explorer link with the object ID of the created object you observed in your own command output, appended to:
-https://explorer.devnet.sui.io/objects/
+https://explorer.sui.io/objects/
 
 ![Magic sword](../../static/magic-sword.png "Magic sword")
 

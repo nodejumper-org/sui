@@ -11,7 +11,6 @@ use fastcrypto::{
     traits::{KeyPair as _, ToFromBytes},
 };
 use narwhal_primary as primary;
-use node::NodeStorage;
 use primary::{NetworkModel, Primary, CHANNEL_CAPACITY};
 use prometheus::Registry;
 use std::{
@@ -19,6 +18,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use storage::NodeStorage;
 use test_utils::{
     make_optimal_certificates, make_optimal_signed_certificates, temp_dir, CommitteeFixture,
 };
@@ -108,7 +108,6 @@ async fn test_rounds_errors() {
         store_primary.proposer_store,
         store_primary.payload_store,
         store_primary.vote_digest_store,
-        store_primary.consensus_store,
         /* tx_consensus */ tx_new_certificates,
         /* rx_consensus */ rx_feedback,
         /* external_consensus */
@@ -194,7 +193,6 @@ async fn test_rounds_return_successful_response() {
         store_primary.proposer_store,
         store_primary.payload_store,
         store_primary.vote_digest_store,
-        store_primary.consensus_store,
         /* tx_consensus */ tx_new_certificates,
         /* rx_consensus */ rx_feedback,
         /* external_consensus */ Some(dag.clone()),
@@ -346,7 +344,6 @@ async fn test_node_read_causal_signed_certificates() {
         primary_store_1.proposer_store.clone(),
         primary_store_1.payload_store.clone(),
         primary_store_1.vote_digest_store.clone(),
-        primary_store_1.consensus_store.clone(),
         /* tx_consensus */ tx_new_certificates,
         /* rx_consensus */ rx_feedback,
         /* dag */ Some(dag.clone()),
@@ -385,7 +382,6 @@ async fn test_node_read_causal_signed_certificates() {
         primary_store_2.proposer_store,
         primary_store_2.payload_store,
         primary_store_2.vote_digest_store,
-        primary_store_2.consensus_store,
         /* tx_consensus */ tx_new_certificates_2,
         /* rx_consensus */ rx_feedback_2,
         /* external_consensus */

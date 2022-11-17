@@ -34,7 +34,7 @@ use crate::{
     test_utils::to_sender_signed_transaction,
 };
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_start_epoch_change() {
     // Create a sender, owning an object and a gas object.
     let (sender, sender_key): (_, AccountKeyPair) = get_key_pair();
@@ -118,18 +118,13 @@ async fn test_start_epoch_change() {
     // Test that when validator is halted, we cannot send any certificate.
     let sigs = states
         .iter()
-        .map(|state| {
-            AuthoritySignInfo::new(0, &transaction.signed_data, state.name, &*state.secret)
-        })
+        .map(|state| AuthoritySignInfo::new(0, transaction.data(), state.name, &*state.secret))
         .collect();
-    let certificate = CertifiedTransaction::new_with_auth_sign_infos(
-        transaction.clone(),
-        sigs,
-        &genesis_committee,
-    )
-    .unwrap()
-    .verify(&genesis_committee)
-    .unwrap();
+    let certificate =
+        CertifiedTransaction::new(transaction.clone().into_message(), sigs, &genesis_committee)
+            .unwrap()
+            .verify(&genesis_committee)
+            .unwrap();
     assert_eq!(
         state.handle_certificate(&certificate).await.unwrap_err(),
         SuiError::ValidatorHaltedAtEpochEnd
@@ -347,8 +342,8 @@ async fn test_cross_epoch_effects_cert() {
     net.committee.epoch += 1;
     // Call to execute_transaction can still succeed.
     let (tx_cert, effects_cert) = net.execute_transaction(&transaction).await.unwrap();
-    assert_eq!(tx_cert.auth_sign_info.epoch, 0);
-    assert_eq!(effects_cert.auth_signature.epoch, 1);
+    assert_eq!(tx_cert.epoch(), 0);
+    assert_eq!(effects_cert.epoch(), 1);
 }
 
 fn enable_reconfig(states: &[Arc<AuthorityState>]) {

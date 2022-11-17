@@ -7,15 +7,15 @@ use crypto::PublicKey;
 use fastcrypto::{hash::Hash, traits::KeyPair as _};
 use indexmap::IndexMap;
 use narwhal_primary as primary;
-use node::NodeStorage;
-use primary::{NetworkModel, PayloadToken, Primary, CHANNEL_CAPACITY};
+use primary::{NetworkModel, Primary, CHANNEL_CAPACITY};
 use prometheus::Registry;
 use std::{
     collections::{BTreeSet, HashMap},
     sync::Arc,
     time::Duration,
 };
-use storage::CertificateStore;
+use storage::NodeStorage;
+use storage::{CertificateStore, PayloadToken};
 use store::Store;
 use test_utils::{
     fixture_batch_with_transactions, make_optimal_certificates, make_optimal_signed_certificates,
@@ -31,7 +31,7 @@ use types::{
 };
 use worker::{metrics::initialise_metrics, Worker};
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_get_collections() {
     let parameters = Parameters {
         batch_size: 200, // Two transactions.
@@ -52,10 +52,10 @@ async fn test_get_collections() {
     // Make the data store.
     let store = NodeStorage::reopen(temp_dir());
 
-    let mut header_ids = Vec::new();
+    let mut header_digests = Vec::new();
     // Blocks/Collections
-    let mut collection_ids = Vec::new();
-    let mut missing_block = CertificateDigest::new([0; 32]);
+    let mut collection_digests = Vec::new();
+    let mut missing_certificate = CertificateDigest::new([0; 32]);
 
     // Generate headers
     for n in 0..5 {
@@ -68,8 +68,8 @@ async fn test_get_collections() {
             .unwrap();
 
         let certificate = fixture.certificate(&header);
-        let block_id = certificate.digest();
-        collection_ids.push(block_id);
+        let digest = certificate.digest();
+        collection_digests.push(digest);
 
         // Write the certificate
         store.certificate_store.write(certificate.clone()).unwrap();
@@ -77,10 +77,10 @@ async fn test_get_collections() {
         // Write the header
         store
             .header_store
-            .async_write(header.clone().id(), header.clone())
+            .async_write(header.clone().digest(), header.clone())
             .await;
 
-        header_ids.push(header.clone().id());
+        header_digests.push(header.clone().digest());
 
         // Write the batches to payload store
         store
@@ -95,7 +95,7 @@ async fn test_get_collections() {
                 .async_write(batch.digest(), batch.clone())
                 .await;
         } else {
-            missing_block = block_id;
+            missing_certificate = digest;
         }
     }
 
@@ -119,7 +119,6 @@ async fn test_get_collections() {
         store.proposer_store.clone(),
         store.payload_store.clone(),
         store.vote_digest_store,
-        store.consensus_store,
         /* tx_consensus */ tx_new_certificates,
         /* rx_consensus */ rx_feedback,
         /* dag */
@@ -149,7 +148,7 @@ async fn test_get_collections() {
     );
 
     // Wait for tasks to start
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_secs(15)).await;
 
     // Test gRPC server with client call
     let mut client = connect_to_validator_client(parameters.clone());
@@ -167,7 +166,7 @@ async fn test_get_collections() {
 
     // Test get 1 collection
     let request = tonic::Request::new(GetCollectionsRequest {
-        collection_ids: vec![collection_ids[0].into()],
+        collection_ids: vec![collection_digests[0].into()],
     });
     let response = client.get_collections(request).await.unwrap();
     let actual_result = response.into_inner().result;
@@ -181,7 +180,7 @@ async fn test_get_collections() {
 
     // Test get 5 collections
     let request = tonic::Request::new(GetCollectionsRequest {
-        collection_ids: collection_ids.iter().map(|&c_id| c_id.into()).collect(),
+        collection_ids: collection_digests.iter().map(|&c_id| c_id.into()).collect(),
     });
     let response = client.get_collections(request).await.unwrap();
     let actual_result = response.into_inner().result;
@@ -216,12 +215,12 @@ async fn test_get_collections() {
     };
 
     assert_eq!(
-        &CertificateDigestProto::from(missing_block),
+        &CertificateDigestProto::from(missing_certificate),
         actual_missing_collection.unwrap()
     );
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 // #[cfg_attr(windows, ignore)]
 #[ignore]
 async fn test_remove_collections() {
@@ -245,9 +244,9 @@ async fn test_remove_collections() {
 
     // Make the data store.
     let store = NodeStorage::reopen(temp_dir());
-    let mut header_ids = Vec::new();
+    let mut header_digests = Vec::new();
     // Blocks/Collections
-    let mut collection_ids = Vec::new();
+    let mut collection_digests = Vec::new();
 
     // Make the Dag
     let (tx_new_certificates, rx_new_certificates) =
@@ -267,8 +266,8 @@ async fn test_remove_collections() {
             .unwrap();
 
         let certificate = fixture.certificate(&header);
-        let block_id = certificate.digest();
-        collection_ids.push(block_id);
+        let digest = certificate.digest();
+        collection_digests.push(digest);
 
         // Write the certificate
         store.certificate_store.write(certificate.clone()).unwrap();
@@ -277,10 +276,10 @@ async fn test_remove_collections() {
         // Write the header
         store
             .header_store
-            .async_write(header.clone().id(), header.clone())
+            .async_write(header.clone().digest(), header.clone())
             .await;
 
-        header_ids.push(header.clone().id());
+        header_digests.push(header.clone().digest());
 
         // Write the batches to payload store
         store
@@ -314,7 +313,6 @@ async fn test_remove_collections() {
         store.proposer_store.clone(),
         store.payload_store.clone(),
         store.vote_digest_store.clone(),
-        store.consensus_store,
         /* tx_consensus */ tx_new_certificates,
         /* rx_consensus */ rx_feedback,
         /* dag */ Some(dag.clone()),
@@ -326,14 +324,14 @@ async fn test_remove_collections() {
     );
 
     // Wait for tasks to start
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_secs(15)).await;
 
     // Test gRPC server with client call
     let mut client = connect_to_validator_client(parameters.clone());
 
     // Test remove 1 collection without spawning worker. Should result in a timeout error
     // when trying to remove batches.
-    let block_to_be_removed = collection_ids.remove(0);
+    let block_to_be_removed = collection_digests.remove(0);
     let request = tonic::Request::new(RemoveCollectionsRequest {
         collection_ids: vec![block_to_be_removed.into()],
     });
@@ -399,7 +397,7 @@ async fn test_remove_collections() {
     // Test remove remaining collections, one collection has its batches intentionally
     // missing but it should not return any errors.
     let request = tonic::Request::new(RemoveCollectionsRequest {
-        collection_ids: collection_ids.iter().map(|&c_id| c_id.into()).collect(),
+        collection_ids: collection_digests.iter().map(|&c_id| c_id.into()).collect(),
     });
     let response = client.remove_collections(request).await.unwrap();
     let actual_result = response.into_inner();
@@ -409,7 +407,7 @@ async fn test_remove_collections() {
     assert_eq!(
         store
             .certificate_store
-            .read_all(collection_ids.clone())
+            .read_all(collection_digests.clone())
             .unwrap()
             .iter()
             .filter(|c| c.is_some())
@@ -421,7 +419,7 @@ async fn test_remove_collections() {
     // Test removing collections again after they have all been removed, no error
     // returned.
     let request = tonic::Request::new(RemoveCollectionsRequest {
-        collection_ids: collection_ids.iter().map(|&c_id| c_id.into()).collect(),
+        collection_ids: collection_digests.iter().map(|&c_id| c_id.into()).collect(),
     });
     let response = client.remove_collections(request).await.unwrap();
     let actual_result = response.into_inner();
@@ -429,7 +427,7 @@ async fn test_remove_collections() {
     assert_eq!(Empty {}, actual_result);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_read_causal_signed_certificates() {
     let fixture = CommitteeFixture::builder().randomize_ports(true).build();
     let committee = fixture.committee();
@@ -442,7 +440,7 @@ async fn test_read_causal_signed_certificates() {
     let primary_store_1 = NodeStorage::reopen(temp_dir());
     let primary_store_2: NodeStorage = NodeStorage::reopen(temp_dir());
 
-    let mut collection_ids: Vec<CertificateDigest> = Vec::new();
+    let mut collection_digests: Vec<CertificateDigest> = Vec::new();
 
     // Make the Dag
     let (tx_new_certificates, rx_new_certificates) =
@@ -475,7 +473,7 @@ async fn test_read_causal_signed_certificates() {
     let (certificates, _next_parents) =
         make_optimal_signed_certificates(1..=4, &genesis, &committee, &keys);
 
-    collection_ids.extend(
+    collection_digests.extend(
         certificates
             .iter()
             .map(|c| c.digest())
@@ -526,7 +524,6 @@ async fn test_read_causal_signed_certificates() {
         primary_store_1.proposer_store.clone(),
         primary_store_1.payload_store.clone(),
         primary_store_1.vote_digest_store.clone(),
-        primary_store_1.consensus_store,
         /* tx_consensus */ tx_new_certificates,
         /* rx_consensus */ rx_feedback,
         /* dag */ Some(dag.clone()),
@@ -566,7 +563,6 @@ async fn test_read_causal_signed_certificates() {
         primary_store_2.proposer_store,
         primary_store_2.payload_store,
         primary_store_2.vote_digest_store,
-        primary_store_2.consensus_store,
         /* tx_consensus */ tx_new_certificates_2,
         /* rx_consensus */ rx_feedback_2,
         /* external_consensus */
@@ -581,7 +577,7 @@ async fn test_read_causal_signed_certificates() {
     );
 
     // Wait for tasks to start
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_secs(15)).await;
 
     // Test gRPC server with client call
     let mut client = connect_to_validator_client(primary_1_parameters.clone());
@@ -598,7 +594,7 @@ async fn test_read_causal_signed_certificates() {
     // Test read causal for existing collection in Primary 1
     // Collection is from round 1 so we expect BFT 1 + 0 * 4 vertices (genesis round elided)
     let request = tonic::Request::new(ReadCausalRequest {
-        collection_id: Some(collection_ids[1].into()),
+        collection_id: Some(collection_digests[1].into()),
     });
 
     let response = client.read_causal(request).await.unwrap();
@@ -621,14 +617,14 @@ async fn test_read_causal_signed_certificates() {
     // to handle retrieving the missing collection from Primary 2 before completing the
     // request for read causal.
     let request = tonic::Request::new(ReadCausalRequest {
-        collection_id: Some(collection_ids[0].into()),
+        collection_id: Some(collection_digests[0].into()),
     });
 
     let response = client.read_causal(request).await.unwrap();
     assert_eq!(1, response.into_inner().collection_ids.len());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_read_causal_unsigned_certificates() {
     telemetry_subscribers::init_for_testing();
 
@@ -658,7 +654,7 @@ async fn test_read_causal_unsigned_certificates() {
     let primary_store_1 = NodeStorage::reopen(temp_dir());
     let primary_store_2: NodeStorage = NodeStorage::reopen(temp_dir());
 
-    let mut collection_ids: Vec<CertificateDigest> = Vec::new();
+    let mut collection_digests: Vec<CertificateDigest> = Vec::new();
 
     // Make the Dag
     let (tx_new_certificates, rx_new_certificates) =
@@ -695,7 +691,7 @@ async fn test_read_causal_unsigned_certificates() {
             .collect::<Vec<PublicKey>>(),
     );
 
-    collection_ids.extend(
+    collection_digests.extend(
         certificates
             .iter()
             .map(|c| c.digest())
@@ -739,7 +735,6 @@ async fn test_read_causal_unsigned_certificates() {
         primary_store_1.proposer_store.clone(),
         primary_store_1.payload_store.clone(),
         primary_store_1.vote_digest_store.clone(),
-        primary_store_1.consensus_store,
         /* tx_consensus */ tx_new_certificates,
         /* rx_consensus */ rx_feedback,
         /* dag */ Some(dag.clone()),
@@ -772,7 +767,6 @@ async fn test_read_causal_unsigned_certificates() {
         primary_store_2.proposer_store,
         primary_store_2.payload_store,
         primary_store_2.vote_digest_store,
-        primary_store_2.consensus_store,
         /* tx_consensus */ tx_new_certificates_2,
         /* rx_consensus */ rx_feedback_2,
         /* external_consensus */
@@ -787,7 +781,7 @@ async fn test_read_causal_unsigned_certificates() {
     );
 
     // Wait for tasks to start
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_secs(15)).await;
 
     // Test gRPC server with client call
     let mut client = connect_to_validator_client(primary_1_parameters.clone());
@@ -804,7 +798,7 @@ async fn test_read_causal_unsigned_certificates() {
     // Test read causal for existing collection in Primary 1
     // Collection is from round 1 so we expect BFT 1 + 0 * 4 vertices (genesis round elided)
     let request = tonic::Request::new(ReadCausalRequest {
-        collection_id: Some(collection_ids[1].into()),
+        collection_id: Some(collection_digests[1].into()),
     });
 
     let response = client.read_causal(request).await.unwrap();
@@ -828,7 +822,7 @@ async fn test_read_causal_unsigned_certificates() {
     // request for read causal. However because these certificates were not signed
     // they will not pass validation during fetch.
     let request = tonic::Request::new(ReadCausalRequest {
-        collection_id: Some(collection_ids[0].into()),
+        collection_id: Some(collection_digests[0].into()),
     });
 
     let status = client.read_causal(request).await.unwrap_err();
@@ -853,8 +847,10 @@ async fn test_read_causal_unsigned_certificates() {
 /// from primary 2. All in all the end goal is to:
 /// * Primary 1 be able to retrieve both certificates 1 & 2 successfully
 /// * Primary 1 be able to fetch the payload for certificates 1 & 2
-#[tokio::test]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn test_get_collections_with_missing_certificates() {
+    telemetry_subscribers::init_for_testing();
+
     // GIVEN keys for two primary nodes
     let fixture = CommitteeFixture::builder().randomize_ports(true).build();
     let committee = fixture.committee();
@@ -915,7 +911,7 @@ async fn test_get_collections_with_missing_certificates() {
     batches_map.insert(certificate_1.digest(), batch_1);
     batches_map.insert(certificate_2.digest(), batch_2);
 
-    let block_ids = vec![certificate_1.digest(), certificate_2.digest()];
+    let digests = vec![certificate_1.digest(), certificate_2.digest()];
 
     // Spawn the primary 1 (which will be the one that we'll interact with)
     let (tx_new_certificates_1, rx_new_certificates_1) =
@@ -938,7 +934,6 @@ async fn test_get_collections_with_missing_certificates() {
         store_primary_1.proposer_store,
         store_primary_1.payload_store,
         store_primary_1.vote_digest_store,
-        store_primary_1.consensus_store,
         /* tx_consensus */ tx_new_certificates_1,
         /* rx_consensus */ rx_feedback_1,
         /* external_consensus */
@@ -999,7 +994,6 @@ async fn test_get_collections_with_missing_certificates() {
         store_primary_2.proposer_store,
         store_primary_2.payload_store,
         store_primary_2.vote_digest_store,
-        store_primary_2.consensus_store,
         /* tx_consensus */ tx_new_certificates_2,
         /* rx_consensus */ rx_feedback_2,
         /* external_consensus */
@@ -1027,16 +1021,16 @@ async fn test_get_collections_with_missing_certificates() {
     );
 
     // Wait for tasks to start
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    tokio::time::sleep(Duration::from_secs(15)).await;
 
     // Test gRPC server with client call
     let mut client = connect_to_validator_client(parameters_1.clone());
 
-    let collection_ids = block_ids;
+    let collection_digests = digests;
 
     // Test get collections
     let request = tonic::Request::new(GetCollectionsRequest {
-        collection_ids: collection_ids.iter().map(|&c_id| c_id.into()).collect(),
+        collection_ids: collection_digests.iter().map(|&c_id| c_id.into()).collect(),
     });
     let response = client.get_collections(request).await.unwrap();
     let actual_result = response.into_inner().result;
@@ -1111,7 +1105,7 @@ async fn fixture_certificate(
 
     // Write the header
     header_store
-        .async_write(header.clone().id(), header.clone())
+        .async_write(header.clone().digest(), header.clone())
         .await;
 
     // Write the batches to payload store

@@ -34,7 +34,7 @@ async fn main() -> Result<(), anyhow::Error> {
 
     let game = TicTacToe {
         game_package_id: opts.game_package_id,
-        client: SuiClient::new(&opts.rpc_server_url, None).await?,
+        client: SuiClient::new(&opts.rpc_server_url, None, None).await?,
         keystore,
     };
 
@@ -99,7 +99,7 @@ impl TicTacToe {
             .client
             .quorum_driver()
             .execute_transaction(
-                Transaction::new(create_game_call, signature).verify()?,
+                Transaction::from_data(create_game_call, signature).verify()?,
                 Some(ExecuteTransactionRequestType::WaitForLocalExecution),
             )
             .await?;
@@ -195,7 +195,7 @@ impl TicTacToe {
                 .client
                 .quorum_driver()
                 .execute_transaction(
-                    Transaction::new(place_mark_call, signature).verify()?,
+                    Transaction::from_data(place_mark_call, signature).verify()?,
                     Some(ExecuteTransactionRequestType::WaitForLocalExecution),
                 )
                 .await?;

@@ -3,6 +3,7 @@
 
 use std::str::FromStr;
 
+use anyhow::ensure;
 use move_bytecode_utils::module_cache::GetModule;
 use move_core_types::account_address::AccountAddress;
 use move_core_types::identifier::IdentStr;
@@ -10,6 +11,7 @@ use move_core_types::identifier::Identifier;
 use move_core_types::language_storage::StructTag;
 use move_core_types::value::MoveStruct;
 use name_variant::NamedVariant;
+
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -37,7 +39,7 @@ pub struct EventEnvelope {
     pub timestamp: u64,
     /// Transaction digest of associated transaction, if any
     pub tx_digest: Option<TransactionDigest>,
-    /// Sequence number, must be nondecreasing for event ingestion idempotency
+    /// Transaction sequence number, must be nondecreasing for event ingestion idempotency
     pub seq_num: u64,
     /// Consecutive per-tx counter assigned to this event.
     pub event_num: u64,
@@ -45,6 +47,39 @@ pub struct EventEnvelope {
     pub event: Event,
     /// json value for MoveStruct (for MoveEvent only)
     pub move_struct_json_value: Option<Value>,
+}
+/// Unique ID of a Sui Event, the ID is a combination of tx seq number and event seq number,
+/// the ID is local to this particular fullnode and will be different from other fullnode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EventID {
+    pub tx_seq: i64,
+    pub event_seq: i64,
+}
+
+impl From<(i64, i64)> for EventID {
+    fn from((tx_seq_num, event_seq_number): (i64, i64)) -> Self {
+        Self {
+            tx_seq: tx_seq_num as i64,
+            event_seq: event_seq_number as i64,
+        }
+    }
+}
+
+impl From<EventID> for String {
+    fn from(id: EventID) -> Self {
+        format!("{}:{}", id.tx_seq, id.event_seq)
+    }
+}
+
+impl TryFrom<String> for EventID {
+    type Error = anyhow::Error;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        let values = value.split(':').collect::<Vec<_>>();
+        ensure!(values.len() == 2, "Malformed EventID : {value}");
+        Ok((i64::from_str(values[0])?, i64::from_str(values[1])?).into())
+    }
 }
 
 impl EventEnvelope {

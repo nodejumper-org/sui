@@ -15,7 +15,6 @@ use crate::metrics::ExecutorMetrics;
 use crate::notifier::Notifier;
 use async_trait::async_trait;
 use config::{Committee, SharedWorkerCache};
-use consensus::ConsensusOutput;
 use crypto::PublicKey;
 use network::P2pNetwork;
 
@@ -25,10 +24,11 @@ use std::sync::Arc;
 use storage::CertificateStore;
 
 use crate::subscriber::spawn_subscriber;
+use mockall::automock;
 use tokio::sync::oneshot;
 use tokio::{sync::watch, task::JoinHandle};
 use types::{
-    metered_channel, CertificateDigest, ConsensusStore, ReconfigureNotification, SequenceNumber,
+    metered_channel, CommittedSubDag, ConsensusOutput, ConsensusStore, ReconfigureNotification,
 };
 
 /// Convenience type representing a serialized transaction.
@@ -37,7 +37,9 @@ pub type SerializedTransaction = Vec<u8>;
 /// Convenience type representing a serialized transaction digest.
 pub type SerializedTransactionDigest = u64;
 
+#[automock]
 #[async_trait]
+// Important - if you add method with the default implementation here make sure to update impl ExecutionState for Arc<T>
 pub trait ExecutionState {
     /// Execute the transaction and atomically persist the consensus index.
     async fn handle_consensus_transaction(
@@ -55,7 +57,7 @@ pub trait ExecutionState {
     /// Current implementation sends this notification at the end of narwhal certificate
     ///
     /// In the future this will be triggered on the actual commit boundary, once per narwhal commit
-    async fn notify_commit_boundary(&self, _consensus_output: &Arc<ConsensusOutput>) {}
+    async fn notify_commit_boundary(&self, _committed_dag: &Arc<CommittedSubDag>) {}
 
     /// Load the last consensus index from storage.
     async fn load_execution_indices(&self) -> ExecutionIndices;
@@ -73,9 +75,9 @@ impl Executor {
         committee: Committee,
         execution_state: State,
         tx_reconfigure: &watch::Sender<ReconfigureNotification>,
-        rx_sequence: metered_channel::Receiver<ConsensusOutput>,
+        rx_sequence: metered_channel::Receiver<CommittedSubDag>,
         registry: &Registry,
-        restored_consensus_output: Vec<ConsensusOutput>,
+        restored_consensus_output: Vec<CommittedSubDag>,
     ) -> SubscriberResult<Vec<JoinHandle<()>>>
     where
         State: ExecutionState + Send + Sync + 'static,
@@ -114,36 +116,47 @@ pub async fn get_restored_consensus_output<State: ExecutionState>(
     consensus_store: Arc<ConsensusStore>,
     certificate_store: CertificateStore,
     execution_state: &State,
-) -> Result<Vec<ConsensusOutput>, SubscriberError> {
-    let mut restored_consensus_output = Vec::new();
-    let consensus_next_index = consensus_store
-        .read_last_consensus_index()
-        .map_err(SubscriberError::StoreError)?;
+) -> Result<Vec<CommittedSubDag>, SubscriberError> {
+    // We always want to recover at least the last committed certificate since we can't know
+    // whether the execution has been interrupted and there are still batches/transactions
+    // that need to be send for execution.
 
-    let next_cert_index = execution_state
+    let last_committed_leader = execution_state
         .load_execution_indices()
         .await
-        .next_certificate_index;
+        .last_committed_round;
 
-    if next_cert_index < consensus_next_index {
-        let missing = consensus_store
-            .read_sequenced_certificates(&(next_cert_index..=consensus_next_index - 1))?
-            .iter()
-            .zip(next_cert_index..consensus_next_index)
-            .filter_map(|(c, seq)| c.map(|digest| (digest, seq)))
-            .collect::<Vec<(CertificateDigest, SequenceNumber)>>();
+    let compressed_sub_dags =
+        consensus_store.read_committed_sub_dags_from(&last_committed_leader)?;
 
-        for (cert_digest, seq) in missing {
-            if let Some(cert) = certificate_store.read(cert_digest).unwrap() {
-                // Save the missing sequence / cert pair as ConsensusOutput to re-send to the executor.
-                restored_consensus_output.push(ConsensusOutput {
-                    certificate: cert,
-                    consensus_index: seq,
-                })
-            }
-        }
+    let mut sub_dags = Vec::new();
+    for compressed_sub_dag in compressed_sub_dags {
+        let (certificate_digests, consensus_indices): (Vec<_>, Vec<_>) =
+            compressed_sub_dag.certificates.into_iter().unzip();
+
+        let certificates = certificate_store
+            .read_all(certificate_digests)?
+            .into_iter()
+            .flatten();
+
+        let outputs = certificates
+            .into_iter()
+            .zip(consensus_indices.into_iter())
+            .map(|(certificate, consensus_index)| ConsensusOutput {
+                certificate,
+                consensus_index,
+            })
+            .collect();
+
+        let leader = certificate_store.read(compressed_sub_dag.leader)?.unwrap();
+
+        sub_dags.push(CommittedSubDag {
+            certificates: outputs,
+            leader,
+        });
     }
-    Ok(restored_consensus_output)
+
+    Ok(sub_dags)
 }
 
 #[async_trait]
@@ -157,6 +170,10 @@ impl<T: ExecutionState + 'static + Send + Sync> ExecutionState for Arc<T> {
         self.as_ref()
             .handle_consensus_transaction(consensus_output, execution_indices, transaction)
             .await
+    }
+
+    async fn notify_commit_boundary(&self, committed_dag: &Arc<CommittedSubDag>) {
+        self.as_ref().notify_commit_boundary(committed_dag).await
     }
 
     async fn load_execution_indices(&self) -> ExecutionIndices {

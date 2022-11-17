@@ -89,8 +89,8 @@ fn compare_certified_transactions(o1: &CertifiedTransaction, o2: &CertifiedTrans
     assert_eq!(o1.digest(), o2.digest());
     // in this ser/de context it's relevant to compare signatures
     assert_eq!(
-        o1.auth_sign_info.signature.as_ref(),
-        o2.auth_sign_info.signature.as_ref()
+        o1.auth_sig().signature.as_ref(),
+        o2.auth_sig().signature.as_ref()
     );
 }
 
@@ -108,8 +108,8 @@ fn compare_transaction_info_responses(
         (Some(cert1), Some(cert2)) => {
             assert_eq!(cert1.digest(), cert2.digest());
             assert_eq!(
-                cert1.auth_sign_info.signature.as_ref(),
-                cert2.auth_sign_info.signature.as_ref()
+                cert1.auth_sig().signature.as_ref(),
+                cert2.auth_sig().signature.as_ref()
             );
         }
         (None, None) => (),
@@ -184,7 +184,7 @@ async fn test_dry_run_transaction() {
     let transaction_digest = *transaction.digest();
 
     let response = authority
-        .dry_run_transaction(transaction, transaction_digest)
+        .dry_exec_transaction(transaction.data().data.clone(), transaction_digest)
         .await;
     assert!(response.is_ok());
 
@@ -232,13 +232,11 @@ async fn test_handle_transfer_transaction_bad_signature() {
     );
 
     let consensus_address = "/ip4/127.0.0.1/tcp/0/http".parse().unwrap();
-    let (tx_consensus_listener, _rx_consensus_listener) = tokio::sync::mpsc::channel(1);
 
     let server = AuthorityServer::new_for_test(
         "/ip4/127.0.0.1/tcp/0/http".parse().unwrap(),
         authority_state.clone(),
         consensus_address,
-        tx_consensus_listener,
     );
     let metrics = server.metrics.clone();
 
@@ -252,14 +250,14 @@ async fn test_handle_transfer_transaction_bad_signature() {
     .unwrap();
 
     let (_unknown_address, unknown_key): (_, AccountKeyPair) = get_key_pair();
-    let mut bad_signature_transfer_transaction = transfer_transaction.clone();
-    bad_signature_transfer_transaction.signed_data.tx_signature = Signature::new_temp(
-        &transfer_transaction.signed_data.data.to_bytes(),
-        &unknown_key,
-    );
+    let mut bad_signature_transfer_transaction = transfer_transaction.clone().into_inner();
+    bad_signature_transfer_transaction
+        .data_mut_for_testing()
+        .tx_signature =
+        Signature::new_temp(&transfer_transaction.data().data.to_bytes(), &unknown_key);
 
     assert!(client
-        .handle_transaction(bad_signature_transfer_transaction.into_inner())
+        .handle_transaction(bad_signature_transfer_transaction)
         .await
         .is_err());
 
@@ -493,9 +491,9 @@ async fn test_handle_transfer_transaction_ok() {
             .unwrap()
             .as_ref()
             .unwrap()
-            .signed_data
+            .data()
             .data,
-        transfer_transaction.signed_data.data
+        transfer_transaction.data().data
     );
 }
 
@@ -611,9 +609,9 @@ pub async fn send_and_confirm_transaction_with_shared(
 
     // Collect signatures from a quorum of authorities
     let committee = authority.committee.load();
-    let certificate = CertifiedTransaction::new_with_auth_sign_infos(
-        transaction,
-        vec![vote.auth_sign_info],
+    let certificate = CertifiedTransaction::new(
+        transaction.into_message(),
+        vec![vote.auth_sig().clone()],
         &committee,
     )
     .unwrap()
@@ -688,7 +686,7 @@ async fn test_publish_dependent_module_ok() {
     let response = send_and_confirm_transaction(&authority, transaction)
         .await
         .unwrap();
-    response.signed_effects.unwrap().effects.status.unwrap();
+    response.signed_effects.unwrap().into_data().status.unwrap();
 
     // check that the dependent module got published
     assert!(authority.get_object(&dependent_module_id).await.is_ok());
@@ -715,7 +713,7 @@ async fn test_publish_module_no_dependencies_ok() {
     let response = send_and_confirm_transaction(&authority, transaction)
         .await
         .unwrap();
-    response.signed_effects.unwrap().effects.status.unwrap();
+    response.signed_effects.unwrap().into_data().status.unwrap();
 
     // check that the module actually got published
     assert!(response.certified_transaction.is_some());
@@ -1011,7 +1009,7 @@ async fn test_handle_confirmation_transaction_receiver_equal_sender() {
         .handle_certificate(&certified_transfer_transaction)
         .await
         .unwrap();
-    response.signed_effects.unwrap().effects.status.unwrap();
+    response.signed_effects.unwrap().into_data().status.unwrap();
     let account = authority_state
         .get_object(&object_id)
         .await
@@ -1065,7 +1063,7 @@ async fn test_handle_confirmation_transaction_ok() {
         .handle_certificate(&certified_transfer_transaction.clone())
         .await
         .unwrap();
-    info.signed_effects.unwrap().effects.status.unwrap();
+    info.signed_effects.unwrap().into_data().status.unwrap();
     // Key check: the ownership has changed
 
     let new_account = authority_state
@@ -1273,19 +1271,13 @@ async fn test_handle_confirmation_transaction_idempotent() {
         .handle_certificate(&certified_transfer_transaction)
         .await
         .unwrap();
-    assert!(info.signed_effects.as_ref().unwrap().effects.status.is_ok());
+    assert!(info.signed_effects.as_ref().unwrap().data().status.is_ok());
 
     let info2 = authority_state
         .handle_certificate(&certified_transfer_transaction)
         .await
         .unwrap();
-    assert!(info2
-        .signed_effects
-        .as_ref()
-        .unwrap()
-        .effects
-        .status
-        .is_ok());
+    assert!(info2.signed_effects.as_ref().unwrap().data().status.is_ok());
 
     // this is valid because we're checking the authority state does not change the certificate
     compare_transaction_info_responses(&info, &info2);
@@ -1417,7 +1409,7 @@ async fn test_move_call_insufficient_gas() {
         .unwrap()
         .signed_effects
         .unwrap()
-        .effects;
+        .into_data();
     let gas_used = effects.gas_used.gas_used();
     let obj_ref = authority_state
         .get_object(&object_id)
@@ -1445,7 +1437,7 @@ async fn test_move_call_insufficient_gas() {
     let response = send_and_confirm_transaction(&authority_state, transaction)
         .await
         .unwrap();
-    let effects = response.signed_effects.unwrap().effects;
+    let effects = response.signed_effects.unwrap().into_data();
     assert!(effects.status.is_err());
     let obj = authority_state
         .get_object(&object_id)
@@ -1746,12 +1738,12 @@ async fn test_idempotent_reversed_confirmation() {
         .await;
     assert!(result1.is_ok());
     let result2 = authority_state
-        .handle_transaction(certified_transfer_transaction.into_inner().to_transaction())
+        .handle_transaction(certified_transfer_transaction.into_unsigned())
         .await;
     assert!(result2.is_ok());
     assert_eq!(
-        result1.unwrap().signed_effects.unwrap().effects,
-        result2.unwrap().signed_effects.unwrap().effects
+        result1.unwrap().signed_effects.unwrap().into_data(),
+        result2.unwrap().signed_effects.unwrap().into_data()
     );
 }
 
@@ -1789,15 +1781,15 @@ async fn test_change_epoch_transaction() {
     // Make sure that the raw transaction will never be accepted by the validator.
     assert_eq!(
         authority_state
-            .handle_transaction(signed_tx.clone().to_transaction())
+            .handle_transaction(signed_tx.clone().into_unsigned())
             .await
             .unwrap_err(),
         SuiError::InvalidSystemTransaction
     );
     let committee = authority_state.committee.load();
-    let certificate = CertifiedTransaction::new_with_auth_sign_infos(
-        signed_tx.clone().to_transaction(),
-        vec![signed_tx.auth_sign_info.clone()],
+    let certificate = CertifiedTransaction::new(
+        signed_tx.clone().into_message(),
+        vec![signed_tx.auth_sig().clone()],
         &committee,
     )
     .unwrap()
@@ -1807,7 +1799,7 @@ async fn test_change_epoch_transaction() {
         .handle_certificate(&certificate)
         .await
         .unwrap();
-    assert!(result.signed_effects.unwrap().effects.status.is_ok());
+    assert!(result.signed_effects.unwrap().into_data().status.is_ok());
     let sui_system_object = authority_state.get_sui_system_state_object().await.unwrap();
     assert_eq!(sui_system_object.epoch, 1);
 }
@@ -1841,7 +1833,7 @@ async fn test_transfer_sui_no_amount() {
         .handle_certificate(&certificate)
         .await
         .unwrap();
-    let effects = response.signed_effects.unwrap().effects;
+    let effects = response.signed_effects.unwrap().into_data();
     // Check that the transaction was successful, and the gas object is the only mutated object,
     // and got transferred. Also check on its version and new balance.
     assert!(effects.status.is_ok());
@@ -1884,7 +1876,7 @@ async fn test_transfer_sui_with_amount() {
         .handle_certificate(&certificate)
         .await
         .unwrap();
-    let effects = response.signed_effects.unwrap().effects;
+    let effects = response.signed_effects.unwrap().into_data();
     // Check that the transaction was successful, the gas object remains in the original owner,
     // and an amount is split out and send to the recipient.
     assert!(effects.status.is_ok());
@@ -1978,7 +1970,11 @@ async fn test_store_revert_state_update() {
         .get_certified_transaction(&tx_digest)
         .unwrap()
         .is_none());
-    assert!(authority_state.database.get_effects(&tx_digest).is_err());
+    assert!(authority_state
+        .database
+        .as_ref()
+        .get_effects(&tx_digest)
+        .is_err());
 }
 
 // helpers
@@ -2009,7 +2005,6 @@ pub async fn init_state_with_committee(
     AuthorityState::new_for_testing(
         committee,
         &authority_key,
-        None,
         None,
         None,
         tx_reconfigure_consensus,
@@ -2143,9 +2138,9 @@ fn init_certified_transaction(
         &*authority_state.secret,
     );
     let committee = authority_state.committee.load();
-    CertifiedTransaction::new_with_auth_sign_infos(
-        transaction,
-        vec![vote.auth_sign_info.clone()],
+    CertifiedTransaction::new(
+        transaction.into_message(),
+        vec![vote.auth_sig().clone()],
         &committee,
     )
     .unwrap()
@@ -2225,7 +2220,7 @@ pub async fn call_move_with_shared(
     let transaction = to_sender_signed_transaction(data, sender_key);
     let response =
         send_and_confirm_transaction_with_shared(authority, transaction, with_shared).await?;
-    Ok(response.signed_effects.unwrap().effects)
+    Ok(response.signed_effects.unwrap().into_data())
 }
 
 pub async fn create_move_object(
@@ -2296,12 +2291,8 @@ async fn make_test_transaction(
             .await
             .unwrap();
         let vote = response.signed_transaction.unwrap();
-        sigs.push(vote.auth_sign_info.clone());
-        if let Ok(cert) = CertifiedTransaction::new_with_auth_sign_infos(
-            vote.to_transaction(),
-            sigs.clone(),
-            &committee,
-        ) {
+        sigs.push(vote.auth_sig().clone());
+        if let Ok(cert) = CertifiedTransaction::new(vote.into_message(), sigs.clone(), &committee) {
             return cert.verify(&committee).unwrap();
         }
     }
@@ -2365,14 +2356,8 @@ async fn shared_object() {
     assert_eq!(shared_object_version, OBJECT_START_VERSION);
 
     // Finally process the certificate and execute the contract. Ensure that the
-    // shared object lock is cleaned up and that its sequence number increased.
+    // shared object sequence number increased.
     authority.handle_certificate(&certificate).await.unwrap();
-
-    let shared_object_lock = authority
-        .db()
-        .get_assigned_object_versions(transaction_digest, [shared_object_id].iter())
-        .unwrap()[0];
-    assert!(shared_object_lock.is_none());
 
     let shared_object_version = authority
         .get_object(&shared_object_id)
@@ -2483,7 +2468,7 @@ async fn test_consensus_message_processed() {
                 .unwrap()
         };
 
-        assert_eq!(effects1.effects, effects2.effects);
+        assert_eq!(effects1.data(), effects2.data());
 
         // If we didn't send consensus before handle_node_sync_certificate, we need to do it now.
         if !send_first {
@@ -2497,7 +2482,7 @@ async fn test_consensus_message_processed() {
 
         // Update to the new gas object for new tx
         gas_object_ref = *effects1
-            .effects
+            .data()
             .mutated
             .iter()
             .map(|(objref, _)| objref)

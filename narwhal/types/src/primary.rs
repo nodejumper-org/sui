@@ -20,6 +20,7 @@ use indexmap::IndexMap;
 use mysten_util_mem::MallocSizeOf;
 use once_cell::sync::OnceCell;
 use proptest_derive::Arbitrary;
+use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use std::time::{Duration, SystemTime};
@@ -27,6 +28,8 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
 };
+use tracing::warn;
+
 #[cfg(test)]
 #[path = "./tests/primary_type_tests.rs"]
 mod primary_type_tests;
@@ -152,7 +155,7 @@ pub struct Header {
     pub payload: IndexMap<BatchDigest, WorkerId>,
     pub parents: BTreeSet<CertificateDigest>,
     #[serde(skip)]
-    id: OnceCell<HeaderDigest>,
+    digest: OnceCell<HeaderDigest>,
     pub signature: Signature,
     pub metadata: Metadata,
 }
@@ -168,15 +171,15 @@ impl HeaderBuilder {
             epoch: self.epoch.unwrap(),
             payload: self.payload.unwrap(),
             parents: self.parents.unwrap(),
-            id: OnceCell::default(),
+            digest: OnceCell::default(),
             signature: Signature::default(),
             metadata: Metadata::default(),
         };
-        h.id.set(h.digest()).unwrap();
+        h.digest.set(Hash::digest(&h)).unwrap();
 
         Ok(Header {
             signature: signer
-                .try_sign(Digest::from(h.digest()).as_ref())
+                .try_sign(Digest::from(Hash::digest(&h)).as_ref())
                 .map_err(|_| fastcrypto::error::FastCryptoError::GeneralError)?,
             ..h
         })
@@ -202,7 +205,7 @@ impl Header {
         epoch: Epoch,
         payload: IndexMap<BatchDigest, WorkerId>,
         parents: BTreeSet<CertificateDigest>,
-        signature_service: &mut SignatureService<Signature, { crypto::DIGEST_LENGTH }>,
+        signature_service: &SignatureService<Signature, { crypto::DIGEST_LENGTH }>,
     ) -> Self {
         let header = Self {
             author,
@@ -210,21 +213,21 @@ impl Header {
             epoch,
             payload,
             parents,
-            id: OnceCell::default(),
+            digest: OnceCell::default(),
             signature: Signature::default(),
             metadata: Metadata::default(),
         };
-        let id = header.digest();
-        header.id.set(id).unwrap();
-        let signature = signature_service.request_signature(id.into()).await;
+        let digest = Hash::digest(&header);
+        header.digest.set(digest).unwrap();
+        let signature = signature_service.request_signature(digest.into()).await;
         Self {
             signature,
             ..header
         }
     }
 
-    pub fn id(&self) -> HeaderDigest {
-        *self.id.get_or_init(|| self.digest())
+    pub fn digest(&self) -> HeaderDigest {
+        *self.digest.get_or_init(|| Hash::digest(self))
     }
 
     pub fn verify(&self, committee: &Committee, worker_cache: SharedWorkerCache) -> DagResult<()> {
@@ -237,8 +240,11 @@ impl Header {
             }
         );
 
-        // Ensure the header id is well formed.
-        ensure!(self.digest() == self.id(), DagError::InvalidHeaderId);
+        // Ensure the header digest is well formed.
+        ensure!(
+            Hash::digest(self) == self.digest(),
+            DagError::InvalidHeaderDigest
+        );
 
         // Ensure the authority has voting rights.
         let voting_rights = committee.stake(&self.author);
@@ -252,13 +258,13 @@ impl Header {
             worker_cache
                 .load()
                 .worker(&self.author, worker_id)
-                .map_err(|_| DagError::MalformedHeader(self.id()))?;
+                .map_err(|_| DagError::MalformedHeader(self.digest()))?;
         }
 
         // Check the signature.
-        let id_digest: Digest<{ crypto::DIGEST_LENGTH }> = Digest::from(self.id());
+        let digest: Digest<{ crypto::DIGEST_LENGTH }> = Digest::from(self.digest());
         self.author
-            .verify(id_digest.as_ref(), &self.signature)
+            .verify(digest.as_ref(), &self.signature)
             .map_err(DagError::from)
     }
 }
@@ -321,7 +327,7 @@ impl fmt::Debug for Header {
         write!(
             f,
             "{}: B{}({}, E{}, {}B)",
-            self.id.get().cloned().unwrap_or_default(),
+            self.digest.get().cloned().unwrap_or_default(),
             self.round,
             self.author.encode_base64(),
             self.epoch,
@@ -341,13 +347,13 @@ impl fmt::Display for Header {
 
 impl PartialEq for Header {
     fn eq(&self, other: &Self) -> bool {
-        self.id() == other.id()
+        self.digest() == other.digest()
     }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Vote {
-    pub id: HeaderDigest,
+    pub digest: HeaderDigest,
     pub round: Round,
     pub epoch: Epoch,
     pub origin: PublicKey,
@@ -359,10 +365,10 @@ impl Vote {
     pub async fn new(
         header: &Header,
         author: &PublicKey,
-        signature_service: &mut SignatureService<Signature, { crypto::DIGEST_LENGTH }>,
+        signature_service: &SignatureService<Signature, { crypto::DIGEST_LENGTH }>,
     ) -> Self {
         let vote = Self {
-            id: header.id(),
+            digest: header.digest(),
             round: header.round,
             epoch: header.epoch,
             origin: header.author.clone(),
@@ -380,7 +386,7 @@ impl Vote {
         S: Signer<Signature>,
     {
         let vote = Self {
-            id: header.id(),
+            digest: header.digest(),
             round: header.round,
             epoch: header.epoch,
             origin: header.author.clone(),
@@ -445,7 +451,7 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for Vote {
 
     fn digest(&self) -> VoteDigest {
         let mut hasher = crypto::DefaultHashFunction::default();
-        hasher.update(Digest::from(self.id));
+        hasher.update(Digest::from(self.digest));
         hasher.update(self.round.to_le_bytes());
         hasher.update(self.epoch.to_le_bytes());
         hasher.update(&self.origin);
@@ -461,7 +467,7 @@ impl fmt::Debug for Vote {
             self.digest(),
             self.round,
             self.author.encode_base64(),
-            self.id,
+            self.digest,
             self.epoch
         )
     }
@@ -714,7 +720,7 @@ impl Hash<{ crypto::DIGEST_LENGTH }> for Certificate {
 
     fn digest(&self) -> CertificateDigest {
         let mut hasher = crypto::DefaultHashFunction::new();
-        hasher.update(Digest::from(self.header.id()));
+        hasher.update(Digest::from(self.header.digest()));
         hasher.update(self.round().to_le_bytes());
         hasher.update(self.epoch().to_le_bytes());
         hasher.update(&self.origin());
@@ -730,7 +736,7 @@ impl fmt::Debug for Certificate {
             self.digest(),
             self.round(),
             self.origin().encode_base64(),
-            self.header.id(),
+            self.header.digest(),
             self.epoch()
         )
     }
@@ -738,7 +744,7 @@ impl fmt::Debug for Certificate {
 
 impl PartialEq for Certificate {
     fn eq(&self, other: &Self) -> bool {
-        let mut ret = self.header.id() == other.header.id();
+        let mut ret = self.header.digest() == other.header.digest();
         ret &= self.round() == other.round();
         ret &= self.epoch() == other.epoch();
         ret &= self.origin() == other.origin();
@@ -761,9 +767,26 @@ impl Affiliated for Certificate {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum PrimaryMessage {
-    Header(Header),
-    Vote(Vote),
     Certificate(Certificate),
+}
+
+/// Used by the primary to request a vote from other primaries on newly produced headers.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RequestVoteRequest {
+    pub header: Header,
+
+    // Optional parent certificates provided by the requester, in case this primary doesn't yet
+    // have them and requires them in order to offer a vote.
+    pub parents: Vec<Certificate>,
+}
+
+/// Used by the primary to reply to RequestVoteRequest.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RequestVoteResponse {
+    pub vote: Option<Vote>,
+
+    // Indicates digests of missing certificates without which a vote cannot be provided.
+    pub missing: Vec<CertificateDigest>,
 }
 
 /// Used by the primary to get specific certificates from other primaries.
@@ -775,21 +798,76 @@ pub struct GetCertificatesRequest {
 /// Used by the primary to reply to GetCertificatesRequest.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GetCertificatesResponse {
-    // TODO should this just be Vec<Certificate>?
     pub certificates: Vec<Certificate>,
 }
 
 /// Used by the primary to fetch certificates from other primaries.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FetchCertificatesRequest {
-    /// The exclusive round number lower bounds to fetch certificates for each authority.
-    /// This corresponds to the highest round processed by each authority at the requestor.
-    ///
-    /// Currently requestor always includes all authorities in this this vector, but a subset should work too.
-    /// Authorities not in this vector do not get their certificates fetched.
-    pub exclusive_lower_bounds: Vec<(PublicKey, Round)>,
+    /// The exclusive lower bound is a round number where each primary should return certificates above that.
+    /// This corresponds to the GC round at the requestor.
+    pub exclusive_lower_bound: Round,
+    /// This contains per authority serialized RoaringBitmap for the round diffs between
+    /// - rounds of certificates to be skipped from the response and
+    /// - the GC round.
+    /// These rounds are skipped because the requestor already has them.
+    pub skip_rounds: Vec<(PublicKey, Vec<u8>)>,
     /// Maximum number of certificates that should be returned.
     pub max_items: usize,
+}
+
+impl FetchCertificatesRequest {
+    #[allow(clippy::mutable_key_type)]
+    pub fn get_bounds(&self) -> (Round, BTreeMap<PublicKey, BTreeSet<Round>>) {
+        let skip_rounds: BTreeMap<PublicKey, BTreeSet<Round>> = self
+            .skip_rounds
+            .iter()
+            .filter_map(|(k, serialized)| {
+                match RoaringBitmap::deserialize_from(&mut &serialized[..]) {
+                    Ok(bitmap) => {
+                        let rounds: BTreeSet<Round> = bitmap
+                            .into_iter()
+                            .map(|r| self.exclusive_lower_bound + r as Round)
+                            .collect();
+                        Some((k.clone(), rounds))
+                    }
+                    Err(e) => {
+                        warn!("Failed to deserialize RoaringBitmap {e}");
+                        None
+                    }
+                }
+            })
+            .collect();
+        (self.exclusive_lower_bound, skip_rounds)
+    }
+
+    #[allow(clippy::mutable_key_type)]
+    pub fn set_bounds(
+        mut self,
+        gc_round: Round,
+        skip_rounds: BTreeMap<PublicKey, BTreeSet<Round>>,
+    ) -> Self {
+        self.exclusive_lower_bound = gc_round;
+        self.skip_rounds = skip_rounds
+            .into_iter()
+            .map(|(k, rounds)| {
+                let mut serialized = Vec::new();
+                rounds
+                    .into_iter()
+                    .map(|v| u32::try_from(v - gc_round).unwrap())
+                    .collect::<RoaringBitmap>()
+                    .serialize_into(&mut serialized)
+                    .unwrap();
+                (k, serialized)
+            })
+            .collect();
+        self
+    }
+
+    pub fn set_max_items(mut self, max_items: usize) -> Self {
+        self.max_items = max_items;
+        self
+    }
 }
 
 /// Used by the primary to reply to FetchCertificatesRequest.
@@ -801,7 +879,7 @@ pub struct FetchCertificatesResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 pub struct PayloadAvailabilityRequest {
-    pub certificate_ids: Vec<CertificateDigest>,
+    pub certificate_digests: Vec<CertificateDigest>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -810,10 +888,10 @@ pub struct PayloadAvailabilityResponse {
 }
 
 impl PayloadAvailabilityResponse {
-    pub fn available_block_ids(&self) -> Vec<CertificateDigest> {
+    pub fn available_certificates(&self) -> Vec<CertificateDigest> {
         self.payload_availability
             .iter()
-            .filter_map(|(id, available)| available.then_some(*id))
+            .filter_map(|(digest, available)| available.then_some(*digest))
             .collect()
     }
 }
@@ -850,7 +928,7 @@ pub struct WorkerDeleteBatchesMessage {
 
 #[derive(Clone, Default, Debug, Eq, PartialEq)]
 pub struct BatchMessage {
-    // TODO: revisit including the id here [see #188]
+    // TODO: revisit including the digest here [see #188]
     pub digest: BatchDigest,
     pub batch: Batch,
 }
@@ -914,7 +992,9 @@ pub struct WorkerInfoResponse {
 }
 
 #[derive(Clone, Serialize, Deserialize, Eq, PartialEq, Debug)]
-pub struct RoundVoteDigestPair {
+pub struct VoteInfo {
+    /// The latest Epoch for which a vote was sent to given authority
+    pub epoch: Epoch,
     /// The latest round for which a vote was sent to given authority
     pub round: Round,
     /// The hash of the vote used to ensure equality

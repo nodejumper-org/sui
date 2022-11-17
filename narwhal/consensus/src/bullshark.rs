@@ -4,14 +4,18 @@
 use crate::metrics::ConsensusMetrics;
 use crate::{
     consensus::{ConsensusProtocol, ConsensusState, Dag},
-    utils, ConsensusOutput,
+    utils,
 };
 use config::{Committee, Stake};
+use crypto::PublicKey;
 use fastcrypto::{hash::Hash, traits::EncodeDecodeBase64};
 use std::{collections::BTreeSet, sync::Arc};
 use tokio::time::Instant;
 use tracing::{debug, error};
-use types::{Certificate, CertificateDigest, ConsensusStore, Round, SequenceNumber, StoreResult};
+use types::{
+    Certificate, CertificateDigest, CommittedSubDag, ConsensusOutput, ConsensusStore, Round,
+    SequenceNumber, StoreResult,
+};
 
 #[cfg(test)]
 #[path = "tests/bullshark_tests.rs"]
@@ -55,7 +59,7 @@ impl ConsensusProtocol for Bullshark {
         state: &mut ConsensusState,
         consensus_index: SequenceNumber,
         certificate: Certificate,
-    ) -> StoreResult<Vec<ConsensusOutput>> {
+    ) -> StoreResult<Vec<CommittedSubDag>> {
         debug!("Processing {:?}", certificate);
         let round = certificate.round();
         let mut consensus_index = consensus_index;
@@ -64,7 +68,7 @@ impl ConsensusProtocol for Bullshark {
         self.log_error_if_missing_parents(&certificate, state);
 
         // Add the new certificate to the local storage.
-        if state.try_insert(certificate).is_err() {
+        if state.try_insert(&certificate).is_err() {
             return Ok(Vec::new());
         }
 
@@ -142,7 +146,7 @@ impl ConsensusProtocol for Bullshark {
 
         // Get an ordered list of past leaders that are linked to the current leader.
         debug!("Leader {:?} has enough support", leader);
-        let mut sequence = Vec::new();
+        let mut committed_sub_dags = Vec::new();
 
         // TODO: duplicated in tusk.rs
         for leader in utils::order_leaders(&self.committee, leader, state, Self::leader)
@@ -150,6 +154,7 @@ impl ConsensusProtocol for Bullshark {
             .rev()
         {
             debug!("Previous Leader {:?} has enough support", leader);
+            let mut sequence = Vec::new();
 
             // Starting from the oldest leader, flatten the sub-dag referenced by the leader.
             for x in utils::order_dag(self.gc_depth, leader, state) {
@@ -174,7 +179,19 @@ impl ConsensusProtocol for Bullshark {
                     &consensus_index,
                     &digest,
                 )?;
+                debug!(
+                    "Store commit index:{}, digest:{}",
+                    &consensus_index, &digest
+                );
             }
+
+            let sub_dag = CommittedSubDag {
+                certificates: sequence,
+                leader: leader.clone(),
+            };
+            self.store
+                .write_committed_sub_dag(&state.last_committed, &sub_dag)?;
+            committed_sub_dags.push(sub_dag);
         }
 
         // record the last time we got a successful leader election
@@ -198,13 +215,14 @@ impl ConsensusProtocol for Bullshark {
             debug!("Latest commit of {}: Round {}", name.encode_base64(), round);
         }
 
-        debug!("Total committed certificates: {}", sequence.len());
+        let total_commits: usize = committed_sub_dags.iter().map(|x| x.len()).sum();
+        debug!("Total committed certificates: {}", total_commits);
 
         self.metrics
             .committed_certificates
-            .observe(sequence.len() as f64);
+            .observe(total_commits as f64);
 
-        Ok(sequence)
+        Ok(committed_sub_dags)
     }
 
     fn update_committee(&mut self, new_committee: Committee) -> StoreResult<()> {
@@ -229,6 +247,21 @@ impl Bullshark {
             last_leader_election: LastRound::default(),
             max_inserted_certificate_round: 0,
             metrics,
+        }
+    }
+
+    // Returns the PublicKey of the authority which is the leader for the provided `round`.
+    // Pay attention that this method will return always the first authority as the leader
+    // when used under a test environment.
+    pub fn leader_authority(committee: &Committee, _round: Round) -> PublicKey {
+        cfg_if::cfg_if! {
+            if #[cfg(test)] {
+                // consensus tests rely on returning the same leader.
+                committee.authorities.iter().next().expect("Empty authorities table!").0.clone()
+            } else {
+                // Elect the leader in a stake-weighted choice seeded by the round
+                committee.leader(_round)
+            }
         }
     }
 
@@ -278,18 +311,9 @@ impl Bullshark {
     ) -> Option<&'a (CertificateDigest, Certificate)> {
         // Note: this function is often called with even rounds only. While we do not aim at random selection
         // yet (see issue #10), repeated calls to this function should still pick from the whole roster of leaders.
-
-        cfg_if::cfg_if! {
-            if #[cfg(test)] {
-                // consensus tests rely on returning the same leader.
-                let leader = committee.authorities.iter().next().expect("Empty authorities table!").0;
-            } else {
-                // Elect the leader in a stake-weighted choice seeded by the round
-                let leader = &committee.leader(round);
-            }
-        }
+        let leader = Self::leader_authority(committee, round);
 
         // Return its certificate and the certificate's digest.
-        dag.get(&round).and_then(|x| x.get(leader))
+        dag.get(&round).and_then(|x| x.get(&leader))
     }
 }

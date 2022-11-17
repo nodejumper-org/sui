@@ -15,6 +15,7 @@ import {
     type CertifiedTransaction,
     type ExecutionStatusType,
     type TransactionKindName,
+    type JsonRpcProvider,
 } from '@mysten/sui.js';
 import { Fragment } from 'react';
 
@@ -22,11 +23,9 @@ import { ReactComponent as ContentSuccessStatus } from '../../assets/SVGIcons/12
 import { ReactComponent as ContentFailedStatus } from '../../assets/SVGIcons/12px/X.svg';
 import { ReactComponent as ContentArrowRight } from '../../assets/SVGIcons/16px/ArrowRight.svg';
 import Longtext from '../../components/longtext/Longtext';
-import { DefaultRpcClient } from '../../utils/api/DefaultRpcClient';
-import { type Network } from '../../utils/api/rpcSetting';
+import { TxTimeType } from '../../components/tx-time/TxTimeType';
 import { deduplicate } from '../../utils/searchUtil';
 import { truncate } from '../../utils/stringUtils';
-import { useTimeAgo } from '../../utils/timeUtils';
 
 import styles from './RecentTxCard.module.css';
 
@@ -125,20 +124,6 @@ function TxStatusType({ content }: { content: TxStatus }) {
     );
 }
 
-function TxTimeType({ timestamp }: { timestamp: number | undefined }) {
-    const timeAgo = useTimeAgo(timestamp, true);
-
-    return (
-        <section>
-            <div
-                style={{
-                    width: '85px',
-                }}
-            >{`${timeAgo}`}</div>
-        </section>
-    );
-}
-
 // Generate table data from the transaction data
 export const genTableDataFromTxData = (
     results: TxnData[],
@@ -229,10 +214,10 @@ export const genTableDataFromTxData = (
 };
 
 export const getDataOnTxDigests = (
-    network: Network | string,
+    rpc: JsonRpcProvider,
     transactions: GetTxnDigestsResponse
 ) =>
-    DefaultRpcClient(network)
+    rpc
         .getTransactionWithEffectsBatch(deduplicate(transactions))
         .then((txEffs) => {
             return (

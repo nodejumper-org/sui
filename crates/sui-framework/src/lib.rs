@@ -7,6 +7,7 @@ use move_core_types::gas_algebra::InternalGas;
 use move_package::BuildConfig as MoveBuildConfig;
 use move_unit_test::{extensions::set_extension_hook, UnitTestingConfig};
 use move_vm_runtime::native_extensions::NativeContextExtensions;
+use move_vm_test_utils::gas_schedule::INITIAL_COST_SCHEDULE;
 use natives::object_runtime::ObjectRuntime;
 use once_cell::sync::Lazy;
 use std::{collections::BTreeMap, path::Path};
@@ -34,8 +35,31 @@ static SUI_FRAMEWORK: Lazy<Vec<CompiledModule>> = Lazy::new(|| {
         .collect()
 });
 
+static SUI_FRAMEWORK_TEST: Lazy<Vec<CompiledModule>> = Lazy::new(|| {
+    const SUI_FRAMEWORK_BYTES: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/sui-framework-test"));
+
+    let serialized_modules: Vec<Vec<u8>> = bcs::from_bytes(SUI_FRAMEWORK_BYTES).unwrap();
+
+    serialized_modules
+        .into_iter()
+        .map(|module| CompiledModule::deserialize(&module).unwrap())
+        .collect()
+});
+
 static MOVE_STDLIB: Lazy<Vec<CompiledModule>> = Lazy::new(|| {
     const MOVE_STDLIB_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/move-stdlib"));
+
+    let serialized_modules: Vec<Vec<u8>> = bcs::from_bytes(MOVE_STDLIB_BYTES).unwrap();
+
+    serialized_modules
+        .into_iter()
+        .map(|module| CompiledModule::deserialize(&module).unwrap())
+        .collect()
+});
+
+static MOVE_STDLIB_TEST: Lazy<Vec<CompiledModule>> = Lazy::new(|| {
+    const MOVE_STDLIB_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/move-stdlib-test"));
 
     let serialized_modules: Vec<Vec<u8>> = bcs::from_bytes(MOVE_STDLIB_BYTES).unwrap();
 
@@ -62,8 +86,16 @@ pub fn get_sui_framework() -> Vec<CompiledModule> {
     Lazy::force(&SUI_FRAMEWORK).to_owned()
 }
 
+pub fn get_sui_framework_test() -> Vec<CompiledModule> {
+    Lazy::force(&SUI_FRAMEWORK_TEST).to_owned()
+}
+
 pub fn get_move_stdlib() -> Vec<CompiledModule> {
     Lazy::force(&MOVE_STDLIB).to_owned()
+}
+
+pub fn get_move_stdlib_test() -> Vec<CompiledModule> {
+    Lazy::force(&MOVE_STDLIB_TEST).to_owned()
 }
 
 pub const DEFAULT_FRAMEWORK_PATH: &str = env!("CARGO_MANIFEST_DIR");
@@ -111,6 +143,7 @@ pub fn run_move_unit_tests(
             ..config
         },
         natives::all_natives(MOVE_STDLIB_ADDRESS, SUI_FRAMEWORK_ADDRESS),
+        Some(INITIAL_COST_SCHEDULE.clone()),
         compute_coverage,
         &mut std::io::stdout(),
     )
@@ -119,8 +152,13 @@ pub fn run_move_unit_tests(
 /// Wrapper of the build command that verifies the framework version. Should eventually be removed once we can
 /// do this in the obvious way (via version checks)
 pub fn build_move_package(path: &Path, config: BuildConfig) -> SuiResult<CompiledPackage> {
+    let test_mode = config.config.test_mode;
     let pkg = config.build(path.to_path_buf())?;
-    pkg.verify_framework_version(get_sui_framework(), get_move_stdlib())?;
+    if test_mode {
+        pkg.verify_framework_version(get_sui_framework_test(), get_move_stdlib_test())?;
+    } else {
+        pkg.verify_framework_version(get_sui_framework(), get_move_stdlib())?;
+    }
     Ok(pkg)
 }
 
@@ -145,6 +183,7 @@ mod tests {
         let examples = vec![
             "basics",
             "defi",
+            "capy",
             "fungible_tokens",
             "games",
             "move_tutorial",

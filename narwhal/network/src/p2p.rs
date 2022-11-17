@@ -62,7 +62,7 @@ impl P2pNetwork {
         let network = anemo::Network::bind("127.0.0.1:0")
             .server_name("narwhal")
             .private_key(
-                crypto::NetworkKeyPair::generate(&mut rand::rngs::OsRng)
+                crypto::NetworkKeyPair::generate(&mut rand::thread_rng())
                     .private()
                     .0
                     .to_bytes(),
@@ -291,24 +291,6 @@ impl UnreliableNetwork<WorkerSynchronizeMessage> for P2pNetwork {
                 .await
         };
         self.unreliable_send(peer, f)
-    }
-}
-
-#[async_trait]
-impl ReliableNetwork<WorkerSynchronizeMessage> for P2pNetwork {
-    type Response = ();
-    async fn send(
-        &mut self,
-        peer: NetworkPublicKey,
-        message: &WorkerSynchronizeMessage,
-    ) -> CancelOnDropHandler<Result<anemo::Response<()>>> {
-        let message = message.to_owned();
-        let f = move |peer| {
-            let message = message.clone();
-            async move { PrimaryToWorkerClient::new(peer).synchronize(message).await }
-        };
-
-        self.send(peer, f).await
     }
 }
 

@@ -15,7 +15,6 @@ mod block_waiter;
 mod certificate_waiter;
 mod core;
 mod grpc_server;
-mod header_waiter;
 mod primary;
 mod proposer;
 mod state_handler;
@@ -37,5 +36,5 @@ pub use crate::{
     block_waiter::{BlockWaiter, GetBlockResponse},
     grpc_server::metrics::EndpointMetrics,
     metrics::PrimaryChannelMetrics,
-    primary::{NetworkModel, PayloadToken, Primary, CHANNEL_CAPACITY},
+    primary::{NetworkModel, Primary, CHANNEL_CAPACITY},
 };
