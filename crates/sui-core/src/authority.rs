@@ -573,7 +573,7 @@ pub struct AuthorityState {
 /// Repeating valid commands should produce no changes and return no error.
 impl AuthorityState {
     pub fn is_fullnode(&self) -> bool {
-        !self.committee.load().authority_exists(&self.name)
+        !self.committee().authority_exists(&self.name)
     }
 
     /// Get a broadcast receiver for updates
@@ -582,7 +582,7 @@ impl AuthorityState {
     }
 
     pub fn epoch(&self) -> EpochId {
-        self.committee.load().epoch
+        self.committee().epoch
     }
 
     pub fn committee_store(&self) -> &Arc<CommitteeStore> {
@@ -2150,7 +2150,7 @@ impl AuthorityState {
     fn verify_narwhal_transaction(&self, certificate: &CertifiedTransaction) -> SuiResult {
         // Check the certificate. Remember that Byzantine authorities may input anything into
         // consensus.
-        certificate.verify_signature(&self.committee.load())
+        certificate.verify_signature(&self.committee())
     }
 
     /// Verifies transaction signatures and other data
@@ -2196,7 +2196,7 @@ impl AuthorityState {
                     warn!("CheckpointSignature authority {} does not match narwhal certificate source {}", data.summary.auth_signature.authority, consensus_output.certificate.origin() );
                     return Err(());
                 }
-                data.verify(&self.committee.load()).map_err(|err|{
+                data.verify(&self.committee()).map_err(|err|{
                     warn!(
                         "Ignoring malformed checkpoint signature (failed to verify) from {}, sequence {}: {:?}",
                         transaction.consensus_output.certificate.header.author, data.summary.summary.sequence_number, err

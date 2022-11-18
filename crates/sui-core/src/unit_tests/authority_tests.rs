@@ -609,7 +609,7 @@ pub async fn send_and_confirm_transaction_with_shared(
     let vote = response.signed_transaction.unwrap().into_inner();
 
     // Collect signatures from a quorum of authorities
-    let committee = authority.committee.load();
+    let committee = authority.committee();
     let certificate = CertifiedTransaction::new(
         transaction.into_message(),
         vec![vote.auth_sig().clone()],
@@ -1767,9 +1767,9 @@ async fn test_genesis_sui_sysmtem_state_object() {
 #[tokio::test]
 async fn test_change_epoch_transaction() {
     let authority_state = init_state().await;
-    let mut committee = (**authority_state.committee.load()).clone();
+    let mut committee = authority_state.clone_committee();
     committee.epoch += 1;
-    authority_state.committee.store(Arc::new(committee));
+    authority_state.update_committee(committee).unwrap();
 
     let tx = VerifiedTransaction::new_change_epoch(1, 100, 100, 0);
     // Make sure that the raw transaction will never be accepted by the validator.
@@ -1780,7 +1780,7 @@ async fn test_change_epoch_transaction() {
             .unwrap_err(),
         SuiError::InvalidSystemTransaction
     );
-    let committee = authority_state.committee.load();
+    let committee = authority_state.committee();
     let certificate = CertifiedTransaction::new(
         tx.clone().into_message(),
         vec![
@@ -2482,7 +2482,7 @@ fn init_certified_transaction(
         authority_state.name,
         &*authority_state.secret,
     );
-    let committee = authority_state.committee.load();
+    let committee = authority_state.committee();
     CertifiedTransaction::new(
         transaction.into_message(),
         vec![vote.auth_sig().clone()],
@@ -2679,7 +2679,7 @@ async fn make_test_transaction(
 
     let transaction = to_sender_signed_transaction(data, sender_key);
 
-    let committee = authorities[0].committee.load();
+    let committee = authorities[0].committee();
     let mut sigs = vec![];
 
     for authority in authorities {

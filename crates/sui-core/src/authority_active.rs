@@ -31,7 +31,7 @@
 
 use arc_swap::ArcSwap;
 use prometheus::Registry;
-use std::{collections::HashMap, ops::Deref, sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use sui_metrics::spawn_monitored_task;
 use sui_types::{base_types::AuthorityName, error::SuiResult};
 use tokio::{
@@ -266,7 +266,7 @@ where
     pub async fn spawn_gossip_process(self: Arc<Self>, degree: usize) -> JoinHandle<()> {
         // Number of tasks at most "degree" and no more than committee - 1
         // (validators do not follow themselves for gossip)
-        let committee = self.state.committee.load().deref().clone();
+        let committee = self.state.clone_committee();
         let target_num_tasks = usize::min(committee.num_members() - 1, degree);
 
         spawn_monitored_task!(gossip_process(&self, target_num_tasks))
@@ -318,7 +318,7 @@ where
         self: Arc<Self>,
         mut lock_guard: MutexGuard<'_, Option<NodeSyncProcessHandle>>,
     ) {
-        let epoch = self.state.committee.load().epoch;
+        let epoch = self.state.epoch();
         info!(?epoch, "respawn_node_sync_process");
         Self::cancel_node_sync_process_impl(&mut lock_guard).await;
 

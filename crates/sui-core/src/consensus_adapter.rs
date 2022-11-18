@@ -249,7 +249,7 @@ impl ConsensusAdapter {
     #[allow(clippy::option_map_unit_fn)]
     async fn submit_await(self: Arc<Self>, transaction: ConsensusTransaction) {
         let should_submit = Self::should_submit(
-            &self.authority.committee.load(),
+            &self.authority.committee(),
             &self.authority.name,
             &transaction,
         );
