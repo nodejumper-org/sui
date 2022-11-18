@@ -21,6 +21,7 @@ use config::{Parameters, SharedCommittee, SharedWorkerCache, WorkerId};
 use crypto::{traits::KeyPair as _, NetworkKeyPair, NetworkPublicKey, PublicKey};
 use futures::StreamExt;
 use multiaddr::{Multiaddr, Protocol};
+use network::failpoints::FailpointsMakeCallbackHandler;
 use network::metrics::MetricsMakeCallbackHandler;
 use network::P2pNetwork;
 use std::{net::Ipv4Addr, sync::Arc};
@@ -170,6 +171,7 @@ impl Worker {
             .layer(CallbackLayer::new(MetricsMakeCallbackHandler::new(
                 inbound_network_metrics,
             )))
+            .layer(CallbackLayer::new(FailpointsMakeCallbackHandler::new()))
             .service(routes);
 
         let outbound_layer = ServiceBuilder::new()
@@ -177,6 +179,7 @@ impl Worker {
             .layer(CallbackLayer::new(MetricsMakeCallbackHandler::new(
                 outbound_network_metrics,
             )))
+            .layer(CallbackLayer::new(FailpointsMakeCallbackHandler::new()))
             .into_inner();
 
         let anemo_config = {
