@@ -1,11 +1,16 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::authority::AuthorityState;
 use crate::authority_client::NetworkAuthorityClientMetrics;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use sui_network::tonic;
+use sui_types::error::SuiResult;
+use sui_types::messages::VerifiedTransaction;
+use sui_types::messages_checkpoint::{CheckpointContents, CheckpointSummary};
+use tracing::debug;
 
 #[async_trait]
 pub trait Reconfigurable {
@@ -58,6 +63,46 @@ impl ReconfigState {
 
     pub fn should_accept_consensus_certs(&self) -> bool {
         !matches!(self.status, ReconfigCertStatus::RejectAllCerts)
+    }
+}
+
+#[async_trait]
+pub trait FinishEpochLastCheckpoint: Sync + Send + 'static {
+    async fn finish_epoch_last_checkpoint(
+        &self,
+        checkpoint_summary: &mut CheckpointSummary,
+        checkpoint_content: &mut CheckpointContents,
+    ) -> SuiResult;
+}
+
+#[async_trait]
+impl FinishEpochLastCheckpoint for AuthorityState {
+    async fn finish_epoch_last_checkpoint(
+        &self,
+        checkpoint_summary: &mut CheckpointSummary,
+        _checkpoint_content: &mut CheckpointContents,
+    ) -> SuiResult {
+        let epoch = checkpoint_summary.epoch;
+        // TODO: Collect the total gas usage summary from the epoch.
+        let (computation_charge, storage_charge, storage_rebate) = (0, 0, 0);
+        let advance_epoch_tx = VerifiedTransaction::new_change_epoch(
+            epoch + 1,
+            storage_charge,
+            computation_charge,
+            storage_rebate,
+        );
+        debug!(
+            ?epoch,
+            "System transaction to advance epoch: {:?}", advance_epoch_tx
+        );
+        let _signed_tx = self
+            .handle_transaction(advance_epoch_tx)
+            .await?
+            .signed_transaction
+            .unwrap()
+            .into_inner();
+        // TODO: Get a cert of the tx, and execute it.
+        Ok(())
     }
 }
 

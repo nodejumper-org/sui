@@ -1771,26 +1771,28 @@ async fn test_change_epoch_transaction() {
     committee.epoch += 1;
     authority_state.committee.store(Arc::new(committee));
 
-    let signed_tx = VerifiedSignedTransaction::new_change_epoch(
-        1,
-        100,
-        100,
-        0,
-        authority_state.name,
-        &*authority_state.secret,
-    );
+    let tx = VerifiedTransaction::new_change_epoch(1, 100, 100, 0);
     // Make sure that the raw transaction will never be accepted by the validator.
     assert_eq!(
         authority_state
-            .handle_transaction(signed_tx.clone().into_unsigned())
+            .handle_transaction(tx.clone())
             .await
             .unwrap_err(),
         SuiError::InvalidSystemTransaction
     );
     let committee = authority_state.committee.load();
     let certificate = CertifiedTransaction::new(
-        signed_tx.clone().into_message(),
-        vec![signed_tx.auth_sig().clone()],
+        tx.clone().into_message(),
+        vec![
+            SignedTransaction::new(
+                0,
+                tx.clone().into_message(),
+                &*authority_state.secret,
+                authority_state.name,
+            )
+            .into_data_and_sig()
+            .1,
+        ],
         &committee,
     )
     .unwrap()

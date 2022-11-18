@@ -16,7 +16,7 @@ use std::{
 };
 
 use anyhow::anyhow;
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, Guard};
 use chrono::prelude::*;
 use fastcrypto::traits::KeyPair;
 use move_bytecode_utils::module_cache::SyncModuleCache;
@@ -604,12 +604,6 @@ impl AuthorityState {
             let transaction_info = self.make_transaction_info(&transaction_digest).await?;
             return Ok(transaction_info);
         }
-
-        // Validators should never sign an external system transaction.
-        fp_ensure!(
-            !transaction.is_system_tx(),
-            SuiError::InvalidSystemTransaction
-        );
 
         let (_gas_status, input_objects) = transaction_input_checker::check_transaction_input(
             &self.database,
@@ -1600,8 +1594,12 @@ impl AuthorityState {
         self.database.clone()
     }
 
+    pub fn committee(&self) -> Guard<Arc<Committee>> {
+        self.committee.load()
+    }
+
     pub fn clone_committee(&self) -> Committee {
-        self.committee.load().clone().deref().clone()
+        self.committee().clone().deref().clone()
     }
 
     pub async fn get_reconfig_state_read_lock_guard(

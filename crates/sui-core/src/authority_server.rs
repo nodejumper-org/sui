@@ -24,7 +24,7 @@ use sui_network::{
     tonic,
 };
 
-use sui_types::{error::*, messages::*};
+use sui_types::{error::*, fp_ensure, messages::*};
 use tap::TapFallible;
 use tokio::time::sleep;
 use tokio::{sync::mpsc::Receiver, task::JoinHandle};
@@ -313,6 +313,13 @@ impl ValidatorService {
         metrics: Arc<ValidatorServiceMetrics>,
     ) -> Result<tonic::Response<TransactionInfoResponse>, tonic::Status> {
         let transaction = request.into_inner();
+
+        // Validators should never sign an external system transaction.
+        fp_ensure!(
+            !transaction.is_system_tx(),
+            SuiError::InvalidSystemTransaction.into()
+        );
+
         let is_consensus_tx = transaction.contains_shared_object();
 
         let _metrics_guard = start_timer(if is_consensus_tx {
