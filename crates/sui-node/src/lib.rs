@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anemo_tower::callback::CallbackLayer;
-use anemo_tower::trace::DefaultMakeSpan;
-use anemo_tower::trace::TraceLayer;
 use anyhow::anyhow;
 use anyhow::bail;
 use anyhow::Result;
@@ -339,20 +337,12 @@ impl SuiNode {
                 NetworkConnectionMetrics::new("sui", &prometheus_registry);
 
             let service = ServiceBuilder::new()
-                .layer(
-                    TraceLayer::new_for_server_errors()
-                        .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO)),
-                )
                 .layer(CallbackLayer::new(MetricsMakeCallbackHandler::new(
                     Arc::new(inbound_network_metrics),
                 )))
                 .service(routes);
 
             let outbound_layer = ServiceBuilder::new()
-                .layer(
-                    TraceLayer::new_for_client_and_server_errors()
-                        .make_span_with(DefaultMakeSpan::new().level(tracing::Level::INFO)),
-                )
                 .layer(CallbackLayer::new(MetricsMakeCallbackHandler::new(
                     Arc::new(outbound_network_metrics),
                 )))
